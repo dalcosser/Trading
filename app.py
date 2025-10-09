@@ -408,48 +408,28 @@ with tab1:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            # Determine VWAP anchor index if enabled
+            # Determine VWAP anchor index if enabled (no re-download; use df already fetched)
             vwap_idx = None
             if show_vwap and vwap_anchor:
-                    if intraday:
-                        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-                    else:
-                        df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), interval=interval, progress=False, auto_adjust=False)
-
-                    if df is None or df.empty:
-                        st.warning("No data returned. Try a different ticker/interval/period.")
-                        st.stop()
-
-                    df = normalize_ohlcv(df)
-                    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-                        if col in df.columns:
-                            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                    # Determine VWAP anchor index if enabled
+                try:
+                    anchor_dt = pd.to_datetime(vwap_anchor)
+                    # find nearest match in index if possible
+                    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
+                        pos = df.index.get_indexer([anchor_dt], method='nearest')
+                        vwap_idx = int(pos[0]) if pos.size and pos[0] != -1 else None
+                except Exception:
                     vwap_idx = None
-                    if show_vwap and vwap_anchor:
-                        try:
-                            if intraday:
-                                # Try to parse as datetime string
-                                anchor_dt = pd.to_datetime(vwap_anchor)
-                                vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
-                            else:
-                                # Date only
-                                anchor_dt = pd.to_datetime(vwap_anchor)
-                                vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
-                        except Exception:
-                            vwap_idx = None
 
-                    # Count rows for subplots (MACD, RSI, Stoch)
-                    rows = 2 + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
-                    row_heights = [0.55, 0.13]
-                    if show_rsi:
-                        row_heights.append(0.09)
-                    if show_sto:
-                        row_heights.append(0.09)
-                    if show_macd:
-                        row_heights.append(0.09)
-                    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
+            # Count rows for subplots (MACD, RSI, Stoch)
+            rows = 2 + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
+            row_heights = [0.55, 0.13]
+            if show_rsi:
+                row_heights.append(0.09)
+            if show_sto:
+                row_heights.append(0.09)
+            if show_macd:
+                row_heights.append(0.09)
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
 
                     # Main candlestick
                     fig.add_trace(go.Candlestick(
@@ -626,14 +606,18 @@ def fetch_expirations(ticker: str) -> list[str]:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_chain(ticker: str, expiration: str):
-    t = yf.Ticker(ticker)
-    oc = t.option_chain(expiration)
-    calls = oc.calls.copy()
-    puts = oc.puts.copy()
-    # normalize column names
-    calls.columns = [str(c).replace(' ', '_').lower() for c in calls.columns]
-    puts.columns  = [str(c).replace(' ', '_').lower()  for c in puts.columns]
-    return calls, puts
+    try:
+        t = yf.Ticker(ticker)
+        oc = t.option_chain(expiration)
+        calls = oc.calls.copy()
+        puts = oc.puts.copy()
+        # normalize column names
+        calls.columns = [str(c).replace(' ', '_').lower() for c in calls.columns]
+        puts.columns  = [str(c).replace(' ', '_').lower()  for c in puts.columns]
+        return calls, puts
+    except Exception as e:
+        # yfinance sometimes returns empty/invalid responses; surface a clearer message
+        raise RuntimeError(f"Failed to fetch option chain for {ticker} @ {expiration}. Provider returned no/invalid data.") from e
 
 def spot_price(ticker: str) -> float | None:
     try:
