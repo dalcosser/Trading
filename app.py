@@ -431,6 +431,10 @@ with tab1:
                 row_heights.append(0.09)
             fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
 
+            # Plotting block (encapsulate to align indentation)
+            if True:
+                if True:
+
                     # Main candlestick
                     fig.add_trace(go.Candlestick(
                         x=df.index, open=df.get("Open"), high=df.get("High"),
