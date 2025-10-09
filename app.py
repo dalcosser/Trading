@@ -6,7 +6,12 @@ from plotly.subplots import make_subplots
 from datetime import date, datetime, timedelta, timezone
 import math
 import yfinance as yf
-import pandas_ta as pta
+try:
+    import pandas_ta as pta  # for candlestick pattern detection
+    HAS_PANDAS_TA = True
+except Exception:
+    pta = None
+    HAS_PANDAS_TA = False
 
 st.set_page_config(page_title="Codex TA Toolkit", layout="wide")
 st.title("📈 Codex TA Toolkit")
@@ -333,15 +338,20 @@ def find_support_resistance(series: pd.Series, lookback: int = 50):
     return supports, resistances
     
 # --- Candlestick Patterns ---
-import pandas_ta as pta
 def detect_patterns(df: pd.DataFrame):
     patterns = {}
-    # Use a few common patterns
+    # If pandas-ta is unavailable, return empty/zero series so the app still works
+    if not HAS_PANDAS_TA or pta is None:
+        for pat in ["cdl_hammer", "cdl_engulfing", "cdl_doji", "cdl_morningstar", "cdl_shootingstar"]:
+            patterns[pat] = pd.Series([0] * len(df), index=df.index)
+        return patterns
+
+    # Use a few common patterns (guard each call)
     for pat in ["cdl_hammer", "cdl_engulfing", "cdl_doji", "cdl_morningstar", "cdl_shootingstar"]:
         try:
             patterns[pat] = getattr(pta, pat)(df["Open"], df["High"], df["Low"], df["Close"])
         except Exception:
-            patterns[pat] = pd.Series([0]*len(df), index=df.index)
+            patterns[pat] = pd.Series([0] * len(df), index=df.index)
     return patterns
 
 def infer_pad_timedelta(interval: str) -> timedelta:
