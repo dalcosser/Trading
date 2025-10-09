@@ -380,7 +380,7 @@ with tab1:
                         entry_idx = None
                 return trades
 
-            # Run backtest if enabled and strategy is selected
+            # Run backtest if enabled and strategy is selected (after all variables are defined)
             trades = []
             if enable_backtest and strategy == "Price crosses above VWAP" and show_vwap and vwap_idx is not None:
                 vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
@@ -404,9 +404,8 @@ with tab1:
                     st.subheader("Backtest Trades")
                     st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
                     st.write(f"**Total Trades:** {len(trade_df)}  |  **Total P&L:** {trade_df['pnl'].sum():.2f}  |  **Win Rate:** {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
-   if not run_chart:
-    st.info("Choose settings in the sidebar and click **Run**.")
-    st.stop()
+    if not run_chart:
+        st.info("Set parameters and click **Run Chart** to render.")
     else:
         try:
             if intraday:
