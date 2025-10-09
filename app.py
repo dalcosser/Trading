@@ -358,55 +358,31 @@ def extend_right_edge(fig: go.Figure, last_ts, interval: str, rows: int):
 
 # ---------------- CHART TAB ----------------
 with tab1:
-            # --- Simple Backtest Logic ---
-            def backtest_price_crosses_vwap(price: pd.Series, vwap: pd.Series):
-                signals = (price > vwap) & (price.shift(1) <= vwap.shift(1))
-                trades = []
-                in_trade = False
-                entry_idx = None
-                for i in range(1, len(price)):
-                    if signals.iloc[i] and not in_trade:
-                        entry_idx = i
-                        in_trade = True
-                    elif in_trade and (price.iloc[i] < vwap.iloc[i]):
-                        trades.append({
-                            'entry_time': price.index[entry_idx],
-                            'entry_price': price.iloc[entry_idx],
-                            'exit_time': price.index[i],
-                            'exit_price': price.iloc[i],
-                            'pnl': price.iloc[i] - price.iloc[entry_idx]
-                        })
-                        in_trade = False
-                        entry_idx = None
-                return trades
-
-            # Run backtest if enabled and strategy is selected (after all variables are defined)
-            trades = []
-            if enable_backtest and strategy == "Price crosses above VWAP" and show_vwap and vwap_idx is not None:
-                vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                trades = backtest_price_crosses_vwap(close, vwap_series)
-                # Plot buy/sell markers
-                for t in trades:
-                    fig.add_trace(go.Scatter(
-                        x=[t['entry_time']], y=[t['entry_price']],
-                        mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=14,
-                        name="Buy"
-                    ), row=1, col=1)
-                    fig.add_trace(go.Scatter(
-                        x=[t['exit_time']], y=[t['exit_price']],
-                        mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=14,
-                        name="Sell"
-                    ), row=1, col=1)
-                # Show summary table
-                if trades:
-                    trade_df = pd.DataFrame(trades)
-                    trade_df['holding_period'] = (trade_df['exit_time'] - trade_df['entry_time']).astype(str)
-                    st.subheader("Backtest Trades")
-                    st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
-                    st.write(f"**Total Trades:** {len(trade_df)}  |  **Total P&L:** {trade_df['pnl'].sum():.2f}  |  **Win Rate:** {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
     if not run_chart:
         st.info("Set parameters and click **Run Chart** to render.")
     else:
+        # --- Simple Backtest Logic ---
+        def backtest_price_crosses_vwap(price: pd.Series, vwap: pd.Series):
+            signals = (price > vwap) & (price.shift(1) <= vwap.shift(1))
+            trades = []
+            in_trade = False
+            entry_idx = None
+            for i in range(1, len(price)):
+                if signals.iloc[i] and not in_trade:
+                    entry_idx = i
+                    in_trade = True
+                elif in_trade and (price.iloc[i] < vwap.iloc[i]):
+                    trades.append({
+                        'entry_time': price.index[entry_idx],
+                        'entry_price': price.iloc[entry_idx],
+                        'exit_time': price.index[i],
+                        'exit_price': price.iloc[i],
+                        'pnl': price.iloc[i] - price.iloc[entry_idx]
+                    })
+                    in_trade = False
+                    entry_idx = None
+            return trades
+
         try:
             if intraday:
                 df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
@@ -425,248 +401,213 @@ with tab1:
             # Determine VWAP anchor index if enabled
             vwap_idx = None
             if show_vwap and vwap_anchor:
-                try:
                     if intraday:
-                        # Try to parse as datetime string
-                        anchor_dt = pd.to_datetime(vwap_anchor)
-                        vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
+                        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
                     else:
-                        # Date only
-                        anchor_dt = pd.to_datetime(vwap_anchor)
-                        vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
-                except Exception:
+                        df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), interval=interval, progress=False, auto_adjust=False)
+
+                    if df is None or df.empty:
+                        st.warning("No data returned. Try a different ticker/interval/period.")
+                        st.stop()
+
+                    df = normalize_ohlcv(df)
+                    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+                    # Determine VWAP anchor index if enabled
                     vwap_idx = None
+                    if show_vwap and vwap_anchor:
+                        try:
+                            if intraday:
+                                # Try to parse as datetime string
+                                anchor_dt = pd.to_datetime(vwap_anchor)
+                                vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
+                            else:
+                                # Date only
+                                anchor_dt = pd.to_datetime(vwap_anchor)
+                                vwap_idx = df.index.get_loc(anchor_dt, method='nearest') if anchor_dt in df.index else None
+                        except Exception:
+                            vwap_idx = None
 
+                    # Count rows for subplots (MACD, RSI, Stoch)
+                    rows = 2 + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
+                    row_heights = [0.55, 0.13]
+                    if show_rsi:
+                        row_heights.append(0.09)
+                    if show_sto:
+                        row_heights.append(0.09)
+                    if show_macd:
+                        row_heights.append(0.09)
+                    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
 
-            # Count rows for subplots (MACD, RSI, Stoch)
-            rows = 2 + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
-            row_heights = [0.55, 0.13]
-            if show_rsi:
-                row_heights.append(0.09)
-            if show_sto:
-                row_heights.append(0.09)
-            if show_macd:
-                row_heights.append(0.09)
-            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
+                    # Main candlestick
+                    fig.add_trace(go.Candlestick(
+                        x=df.index, open=df.get("Open"), high=df.get("High"),
+                        low=df.get("Low"), close=df.get("Close"), name="OHLC"
+                    ), row=1, col=1)
 
+                    close_key = pick_close_key(df.columns)
+                    if close_key is None:
+                        st.error(f"No usable 'Close' found after normalization. Columns: {list(df.columns)}")
+                        st.stop()
+                    close = df[close_key].astype(float)
 
+                    # Add price labels to right side if enabled
+                    def add_price_label(trace_name, y_val, color):
+                        fig.add_annotation(
+                            xref="paper", x=1.01, y=y_val,
+                            xanchor="left", yanchor="middle",
+                            text=f"{trace_name}: {y_val:.2f}",
+                            font=dict(color=color, size=13),
+                            showarrow=False, align="left",
+                            bgcolor="#222" if template=="plotly_dark" else "#fff",
+                            bordercolor=color, borderwidth=1, opacity=0.95
+                        )
 
-            # Main candlestick
-            fig.add_trace(go.Candlestick(
-                x=df.index, open=df.get("Open"), high=df.get("High"),
-                low=df.get("Low"), close=df.get("Close"), name="OHLC"
-            ), row=1, col=1)
+                    if show_price_labels:
+                        # Candlestick close
+                        if len(close) > 0:
+                            add_price_label("Close", close.iloc[-1], "#00bfff")
+                        # Anchored VWAP
+                        if show_vwap and vwap_idx is not None:
+                            vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
+                            last_vwap = vwap_series.dropna().iloc[-1] if vwap_series.dropna().size > 0 else None
+                            if last_vwap is not None:
+                                add_price_label("VWAP", last_vwap, "#ff9900")
+                        # SMA/EMA
+                        for n in sma_selected:
+                            s = sma(close, int(n))
+                            if len(s.dropna()) > 0:
+                                add_price_label(f"SMA({n})", s.dropna().iloc[-1], "#8888ff")
+                        for n in ema_selected:
+                            e = ema(close, int(n))
+                            if len(e.dropna()) > 0:
+                                add_price_label(f"EMA({n})", e.dropna().iloc[-1], "#ff88ff")
 
-            # Add price labels to right side if enabled
-            def add_price_label(trace_name, y_val, color):
-                fig.add_annotation(
-                    xref="paper", x=1.01, y=y_val,
-                    xanchor="left", yanchor="middle",
-                    text=f"{trace_name}: {y_val:.2f}",
-                    font=dict(color=color, size=13),
-                    showarrow=False, align="left",
-                    bgcolor="#222" if template=="plotly_dark" else "#fff",
-                    bordercolor=color, borderwidth=1, opacity=0.95
-                )
+                    # Plot anchored VWAP if enabled
+                    if show_vwap and vwap_idx is not None:
+                        vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
+                        fig.add_trace(go.Scatter(x=df.index, y=vwap_series, mode="lines", name="Anchored VWAP", line=dict(color="#ff9900", width=2, dash="dash")), row=1, col=1)
 
-            if show_price_labels:
-                # Candlestick close
-                if len(close) > 0:
-                    add_price_label("Close", close.iloc[-1], "#00bfff")
-                # Anchored VWAP
-                if show_vwap and vwap_idx is not None:
-                    vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                    last_vwap = vwap_series.dropna().iloc[-1] if vwap_series.dropna().size > 0 else None
-                    if last_vwap is not None:
-                        add_price_label("VWAP", last_vwap, "#ff9900")
-                # SMA/EMA
-                for n in sma_selected:
-                    s = sma(close, int(n))
-                    if len(s.dropna()) > 0:
-                        add_price_label(f"SMA({n})", s.dropna().iloc[-1], "#8888ff")
-                for n in ema_selected:
-                    e = ema(close, int(n))
-                    if len(e.dropna()) > 0:
-                        add_price_label(f"EMA({n})", e.dropna().iloc[-1], "#ff88ff")
-
-            # Plot anchored VWAP if enabled
-            if show_vwap and vwap_idx is not None:
-                vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                fig.add_trace(go.Scatter(x=df.index, y=vwap_series, mode="lines", name="Anchored VWAP", line=dict(color="#ff9900", width=2, dash="dash")), row=1, col=1)
-
-            fig.add_trace(go.Candlestick(
-                x=df.index, open=df.get("Open"), high=df.get("High"),
-                low=df.get("Low"), close=df.get("Close"), name="OHLC"
-            ), row=1, col=1)
-
-
-
-            close_key = pick_close_key(df.columns)
-            if close_key is None:
-                st.error(f"No usable 'Close' found after normalization. Columns: {list(df.columns)}")
-                st.stop()
-            close = df[close_key].astype(float)
-
-            # Add price labels to right side if enabled
-            def add_price_label(trace_name, y_val, color):
-                fig.add_annotation(
-                    xref="paper", x=1.01, y=y_val,
-                    xanchor="left", yanchor="middle",
-                    text=f"{trace_name}: {y_val:.2f}",
-                    font=dict(color=color, size=13),
-                    showarrow=False, align="left",
-                    bgcolor="#222" if template=="plotly_dark" else "#fff",
-                    bordercolor=color, borderwidth=1, opacity=0.95
-                )
-
-            if show_price_labels:
-                # Candlestick close
-                if len(close) > 0:
-                    add_price_label("Close", close.iloc[-1], "#00bfff")
-                # Anchored VWAP
-                if show_vwap and vwap_idx is not None:
-                    vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                    last_vwap = vwap_series.dropna().iloc[-1] if vwap_series.dropna().size > 0 else None
-                    if last_vwap is not None:
-                        add_price_label("VWAP", last_vwap, "#ff9900")
-                # SMA/EMA
-                for n in sma_selected:
-                    s = sma(close, int(n))
-                    if len(s.dropna()) > 0:
-                        add_price_label(f"SMA({n})", s.dropna().iloc[-1], "#8888ff")
-                for n in ema_selected:
-                    e = ema(close, int(n))
-                    if len(e.dropna()) > 0:
-                        add_price_label(f"EMA({n})", e.dropna().iloc[-1], "#ff88ff")
-
-            # Add price labels to right side if enabled
-            def add_price_label(trace_name, y_val, color):
-                fig.add_annotation(
-                    xref="paper", x=1.01, y=y_val,
-                    xanchor="left", yanchor="middle",
-                    text=f"{trace_name}: {y_val:.2f}",
-                    font=dict(color=color, size=13),
-                    showarrow=False, align="left",
-                    bgcolor="#222" if template=="plotly_dark" else "#fff",
-                    bordercolor=color, borderwidth=1, opacity=0.95
-                )
-
-            if show_price_labels:
-                # Candlestick close
-                if len(close) > 0:
-                    add_price_label("Close", close.iloc[-1], "#00bfff")
-                # Anchored VWAP
-                if show_vwap and vwap_idx is not None:
-                    vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                    last_vwap = vwap_series.dropna().iloc[-1] if vwap_series.dropna().size > 0 else None
-                    if last_vwap is not None:
-                        add_price_label("VWAP", last_vwap, "#ff9900")
-                # SMA/EMA
-                for n in sma_selected:
-                    s = sma(close, int(n))
-                    if len(s.dropna()) > 0:
-                        add_price_label(f"SMA({n})", s.dropna().iloc[-1], "#8888ff")
-                for n in ema_selected:
-                    e = ema(close, int(n))
-                    if len(e.dropna()) > 0:
-                        add_price_label(f"EMA({n})", e.dropna().iloc[-1], "#ff88ff")
-
-            if bb_on:
-                lb, mb, ub = bbands(close, int(bb_len), float(bb_std))
-                fig.add_trace(go.Scatter(x=df.index, y=lb, mode="lines", name=lb.name), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=mb, mode="lines", name=mb.name), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=ub, mode="lines", name=ub.name), row=1, col=1)
+                    if bb_on:
+                        lb, mb, ub = bbands(close, int(bb_len), float(bb_std))
+                        fig.add_trace(go.Scatter(x=df.index, y=lb, mode="lines", name=lb.name), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=mb, mode="lines", name=mb.name), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=ub, mode="lines", name=ub.name), row=1, col=1)
                 
-                # Support/Resistance
-                if show_sr:
-                    supports, resistances = find_support_resistance(close, int(sr_lookback))
-                    for t, y in supports:
-                        fig.add_hline(y=y, line_dash="dot", line_color="#2ecc40", annotation_text="Support", annotation_position="left", row=1, col=1)
-                    for t, y in resistances:
-                        fig.add_hline(y=y, line_dash="dot", line_color="#ff4136", annotation_text="Resistance", annotation_position="left", row=1, col=1)
+                        # Support/Resistance
+                        if show_sr:
+                            supports, resistances = find_support_resistance(close, int(sr_lookback))
+                            for t, y in supports:
+                                fig.add_hline(y=y, line_dash="dot", line_color="#2ecc40", annotation_text="Support", annotation_position="left", row=1, col=1)
+                            for t, y in resistances:
+                                fig.add_hline(y=y, line_dash="dot", line_color="#ff4136", annotation_text="Resistance", annotation_position="left", row=1, col=1)
                 
-                # Candlestick Patterns
-                if show_patterns:
-                    patterns = detect_patterns(df)
-                    for pat, ser in patterns.items():
-                        # Markers for detected patterns
-                        pat_idx = ser[ser != 0].index
-                        fig.add_trace(go.Scatter(x=pat_idx, y=close.loc[pat_idx], mode="markers", marker_symbol="star", marker_size=12, name=pat), row=1, col=1)
+                        # Candlestick Patterns
+                        if show_patterns:
+                            patterns = detect_patterns(df)
+                            for pat, ser in patterns.items():
+                                # Markers for detected patterns
+                                pat_idx = ser[ser != 0].index
+                                fig.add_trace(go.Scatter(x=pat_idx, y=close.loc[pat_idx], mode="markers", marker_symbol="star", marker_size=12, name=pat), row=1, col=1)
 
-            for n in sma_selected:
-                s = sma(close, int(n))
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=s.name), row=1, col=1)
-            for n in ema_selected:
-                e = ema(close, int(n))
-                fig.add_trace(go.Scatter(x=df.index, y=e, mode="lines", name=e.name), row=1, col=1)
+                    for n in sma_selected:
+                        s = sma(close, int(n))
+                        fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=s.name), row=1, col=1)
+                    for n in ema_selected:
+                        e = ema(close, int(n))
+                        fig.add_trace(go.Scatter(x=df.index, y=e, mode="lines", name=e.name), row=1, col=1)
 
-            if "Volume" in df.columns and df["Volume"].notna().any():
-                vol_colors = np.where(close >= df.get("Open", close), "rgba(0,200,0,0.6)", "rgba(200,0,0,0.6)")
-                fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=vol_colors, showlegend=False), row=2, col=1)
-            else:
-                fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="Volume", showlegend=False), row=2, col=1)
+                    if "Volume" in df.columns and df["Volume"].notna().any():
+                        vol_colors = np.where(close >= df.get("Open", close), "rgba(0,200,0,0.6)", "rgba(200,0,0,0.6)")
+                        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=vol_colors, showlegend=False), row=2, col=1)
+                    else:
+                        fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="Volume", showlegend=False), row=2, col=1)
 
-            next_row = 3
-            if show_rsi:
-                r = rsi(close, int(rsi_len))
-                fig.add_trace(go.Scatter(x=df.index, y=r, mode="lines", name=r.name), row=next_row, col=1)
-                fig.add_hline(y=30, line_dash="dot", line_color="#555", row=next_row, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="#555", row=next_row, col=1)
-                fig.update_yaxes(range=[0, 100], row=next_row, col=1, title_text="RSI")
-                next_row += 1
+                    next_row = 3
+                    if show_rsi:
+                        r = rsi(close, int(rsi_len))
+                        fig.add_trace(go.Scatter(x=df.index, y=r, mode="lines", name=r.name), row=next_row, col=1)
+                        fig.add_hline(y=30, line_dash="dot", line_color="#555", row=next_row, col=1)
+                        fig.add_hline(y=70, line_dash="dot", line_color="#555", row=next_row, col=1)
+                        fig.update_yaxes(range=[0, 100], row=next_row, col=1, title_text="RSI")
+                        next_row += 1
 
-            if show_sto:
-                k, d = stoch_kd(df["High"], df["Low"], close, int(sto_k), int(sto_d), int(sto_smooth))
-                fig.add_trace(go.Scatter(x=df.index, y=k, mode="lines", name=k.name), row=next_row, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name=d.name), row=next_row, col=1)
-                fig.add_hline(y=20, line_dash="dot", line_color="#555", row=next_row, col=1)
-                fig.add_hline(y=80, line_dash="dot", line_color="#555", row=next_row, col=1)
-                fig.update_yaxes(range=[0, 100], row=next_row, col=1, title_text="Stoch")
-                
-                if show_macd:
-                    macd_line, signal_line, hist = macd(close, int(macd_fast), int(macd_slow), int(macd_signal))
-                    fig.add_trace(go.Scatter(x=df.index, y=macd_line, mode="lines", name="MACD"), row=next_row, col=1)
-                    fig.add_trace(go.Scatter(x=df.index, y=signal_line, mode="lines", name="Signal"), row=next_row, col=1)
-                    fig.add_trace(go.Bar(x=df.index, y=hist, name="Hist", marker_color=np.where(hist>=0, "#2ecc40", "#ff4136")), row=next_row, col=1)
-                    fig.update_yaxes(title_text="MACD", row=next_row, col=1)
-                    next_row += 1
+                    if show_sto:
+                        k, d = stoch_kd(df["High"], df["Low"], close, int(sto_k), int(sto_d), int(sto_smooth))
+                        fig.add_trace(go.Scatter(x=df.index, y=k, mode="lines", name=k.name), row=next_row, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name=d.name), row=next_row, col=1)
+                        fig.add_hline(y=20, line_dash="dot", line_color="#555", row=next_row, col=1)
+                        fig.add_hline(y=80, line_dash="dot", line_color="#555", row=next_row, col=1)
+                        fig.update_yaxes(range=[0, 100], row=next_row, col=1, title_text="Stoch")
+                        next_row += 1
 
-            last_ts = pd.to_datetime(df.index[-1])
-            extend_right_edge(fig, last_ts, interval, rows)
+                    if show_macd:
+                        macd_line, signal_line, hist = macd(close, int(macd_fast), int(macd_slow), int(macd_signal))
+                        fig.add_trace(go.Scatter(x=df.index, y=macd_line, mode="lines", name="MACD"), row=next_row, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=signal_line, mode="lines", name="Signal"), row=next_row, col=1)
+                        fig.add_trace(go.Bar(x=df.index, y=hist, name="Hist", marker_color=np.where(hist>=0, "#2ecc40", "#ff4136")), row=next_row, col=1)
+                        fig.update_yaxes(title_text="MACD", row=next_row, col=1)
+                        next_row += 1
 
-            fig.update_layout(title=f"{ticker} — {interval}", xaxis_rangeslider_visible=False, height=base_height)
-            style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
+                    last_ts = pd.to_datetime(df.index[-1])
+                    extend_right_edge(fig, last_ts, interval, rows)
 
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}")
+                    # --- Run backtest if enabled and strategy is selected ---
+                    trades = []
+                    if enable_backtest and strategy == "Price crosses above VWAP" and show_vwap and vwap_idx is not None:
+                        vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
+                        trades = backtest_price_crosses_vwap(close, vwap_series)
+                        # Plot buy/sell markers
+                        for t in trades:
+                            fig.add_trace(go.Scatter(
+                                x=[t['entry_time']], y=[t['entry_price']],
+                                mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=14,
+                                name="Buy"
+                            ), row=1, col=1)
+                            fig.add_trace(go.Scatter(
+                                x=[t['exit_time']], y=[t['exit_price']],
+                                mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=14,
+                                name="Sell"
+                            ), row=1, col=1)
+                        # Show summary table
+                        if trades:
+                            trade_df = pd.DataFrame(trades)
+                            trade_df['holding_period'] = (trade_df['exit_time'] - trade_df['entry_time']).astype(str)
+                            st.subheader("Backtest Trades")
+                            st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
+                            st.write(f"**Total Trades:** {len(trade_df)}  |  **Total P&L:** {trade_df['pnl'].sum():.2f}  |  **Win Rate:** {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
 
+                    fig.update_layout(title=f"{ticker} — {interval}", xaxis_rangeslider_visible=False, height=base_height)
+                    style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
+
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}")
         except Exception as e:
             st.error(f"Error fetching or plotting data: {e}")
-
-# ---------------- OPTIONS TAB ----------------
-
-# Lightweight BS delta (no scipy)
-SQRT2 = math.sqrt(2.0)
-SQRT2PI = math.sqrt(2.0 * math.pi)
-def _phi(x: float) -> float:  # pdf
-    return math.exp(-0.5 * x * x) / SQRT2PI
-def _Phi(x: float) -> float:  # cdf via erf
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def bs_delta(S: float, K: float, T: float, r: float, sigma: float, q: float, kind: str) -> float:
-    """Compute approximate Black-Scholes delta (no scipy)."""
-    try:
-        if sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
-            return math.nan
-        d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-        if kind == "call":
-            return math.exp(-q * T) * 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
-        else:
-            return -math.exp(-q * T) * 0.5 * (1.0 - math.erf(d1 / math.sqrt(2.0)))
-    except Exception:
-        return math.nan
-
+# --- Black-Scholes Delta function ---
+def bs_delta(S, K, T, r, sigma, q, kind="call"):
+    """
+    Black-Scholes option delta.
+    S: spot price
+    K: strike price
+    T: time to expiry (in years)
+    r: risk-free rate
+    sigma: volatility (annualized)
+    q: dividend yield
+    kind: "call" or "put"
+    """
+    import math
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return float("nan")
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    if kind == "call":
+        from scipy.stats import norm
+        return math.exp(-q * T) * norm.cdf(d1)
+    else:
+        from scipy.stats import norm
+        return -math.exp(-q * T) * norm.cdf(-d1)
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_expirations(ticker: str) -> list[str]:
