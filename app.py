@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 from datetime import date, datetime, timedelta, timezone
 import math
 import yfinance as yf
+from typing import Optional
 try:
     import pandas_ta as pta  # for candlestick pattern detection
     HAS_PANDAS_TA = True
@@ -241,6 +242,89 @@ with st.sidebar:
 # ---------------- Helpers (chart) ----------------
 TARGETS = {"open", "high", "low", "close", "adj close", "adj_close", "adjclose", "volume"}
 
+# --- Data fetch fallback helpers ---
+def best_period_for(interval_str: str, desired: Optional[str]) -> str:
+    if interval_str == "1m":
+        return "7d"
+    if interval_str in {"5m", "15m", "30m", "60m", "1h"}:
+        return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
+    return desired or "1y"
+
+@st.cache_data(show_spinner=False, ttl=120)
+def fetch_ohlc_with_fallback(
+    ticker: str,
+    *,
+    interval: str,
+    period: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    import pandas as _pd
+    from time import sleep as _sleep
+
+    # 1) yfinance with small retries
+    for attempt in range(3):
+        try:
+            if period:
+                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+            else:
+                df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
+            if isinstance(df, _pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+        _sleep(0.6 * (attempt + 1))
+
+    # Retry with auto_adjust=True once
+    try:
+        if period:
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        else:
+            df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=True)
+        if isinstance(df, _pd.DataFrame) and not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 2) yahooquery fallback (if installed)
+    try:
+        from yahooquery import Ticker as _YQTicker
+        yq = _YQTicker(ticker)
+        if period:
+            yq_df = yq.history(period=period, interval=interval)
+        else:
+            yq_df = yq.history(start=start, end=end, interval=interval)
+
+        if yq_df is None or yq_df.empty:
+            return _pd.DataFrame()
+
+        # Flatten MultiIndex to DatetimeIndex if needed
+        if isinstance(yq_df.index, _pd.MultiIndex):
+            if 'date' in yq_df.index.names:
+                yq_df = yq_df.reset_index().set_index('date')
+            else:
+                yq_df = yq_df.reset_index()
+        if not isinstance(yq_df.index, _pd.DatetimeIndex) and 'date' in yq_df.columns:
+            yq_df['date'] = _pd.to_datetime(yq_df['date'])
+            yq_df = yq_df.set_index('date')
+
+        rename = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "adjclose": "Adj Close",
+            "adj_close": "Adj Close",
+            "volume": "Volume",
+        }
+        yq_df = yq_df.rename(columns=lambda c: rename.get(str(c).lower(), str(c).title()))
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in yq_df.columns]
+        if keep:
+            yq_df = yq_df[keep]
+        return yq_df
+    except Exception:
+        return _pd.DataFrame()
+
 # --- Anchored VWAP ---
 def anchored_vwap(df: pd.DataFrame, anchor_idx: int = 0, price_col: str = "Close", vol_col: str = "Volume") -> pd.Series:
     """
@@ -394,13 +478,26 @@ with tab1:
             return trades
 
         try:
+            # Map allowed intraday periods for Yahoo
+            def best_period_for(interval_str: str, desired: str | None) -> str:
+                if interval_str == "1m":
+                    return "7d"  # Yahoo max for 1m
+                if interval_str in {"5m", "15m", "30m", "60m", "1h"}:
+                    return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
+                return desired or "1y"
+
             if intraday:
-                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+                p = best_period_for(interval, str(period))
+                df = fetch_ohlc_with_fallback(ticker, interval=interval, period=p)
             else:
-                df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), interval=interval, progress=False, auto_adjust=False)
+                # Ensure valid date order and include selected end date (Yahoo end is exclusive)
+                s = min(pd.to_datetime(start), pd.to_datetime(end)).date()
+                e = max(pd.to_datetime(start), pd.to_datetime(end)).date()
+                e_inclusive = (e + timedelta(days=1)).isoformat()
+                df = fetch_ohlc_with_fallback(ticker, interval=interval, start=s.isoformat(), end=e_inclusive)
 
             if df is None or df.empty:
-                st.warning("No data returned. Try a different ticker/interval/period.")
+                st.warning(f"No data for {ticker} @ interval={interval}. Tried yfinance and yahooquery.")
                 st.stop()
 
             df = normalize_ohlcv(df)
@@ -605,8 +702,13 @@ def bs_delta(S, K, T, r, sigma, q, kind="call"):
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_expirations(ticker: str) -> list[str]:
-    t = yf.Ticker(ticker)
-    return t.options or []
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options or []
+        return exps
+    except Exception as e:
+        # Surface a clearer message than underlying JSON decode errors
+        raise RuntimeError(f"Failed to fetch expirations for {ticker}. Provider returned no/invalid data.") from e
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_chain(ticker: str, expiration: str):
