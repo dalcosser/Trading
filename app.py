@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 from datetime import date, datetime, timedelta, timezone
 import math
 import yfinance as yf
+import time
 from typing import Optional
 try:
     import pandas_ta as pta  # for candlestick pattern detection
@@ -238,6 +239,16 @@ with st.sidebar:
     show_price_labels = st.checkbox("Show price labels (right)", value=False)
 
     run_chart = st.button("Run Chart", use_container_width=True)
+    force_fresh = st.checkbox("Force fresh fetch (bypass cache)", value=False)
+    try:
+        st.session_state['force_refresh'] = force_fresh
+    except Exception:
+        pass
+    prefer_yq_intraday = st.checkbox("Prefer YahooQuery (all intervals)", value=True)
+    try:
+        st.session_state['prefer_yq_intraday'] = prefer_yq_intraday
+    except Exception:
+        pass
 
 # ---------------- Helpers (chart) ----------------
 TARGETS = {"open", "high", "low", "close", "adj close", "adj_close", "adjclose", "volume"}
@@ -250,8 +261,7 @@ def best_period_for(interval_str: str, desired: Optional[str]) -> str:
         return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
     return desired or "1y"
 
-@st.cache_data(show_spinner=False, ttl=120)
-def fetch_ohlc_with_fallback(
+def _fetch_ohlc_uncached(
     ticker: str,
     *,
     interval: str,
@@ -262,68 +272,208 @@ def fetch_ohlc_with_fallback(
     import pandas as _pd
     from time import sleep as _sleep
 
-    # 1) yfinance with small retries
+    # Normalize interval for providers (Yahoo prefers '60m' over '1h')
+    _interval = '60m' if interval == '1h' else interval
+
+    # Collect errors for diagnostics
+    try:
+        st.session_state['last_fetch_errors'] = []
+    except Exception:
+        pass
+
+    # Decide order for providers
+    try:
+        _prefer_yq = bool(st.session_state.get('prefer_yq_intraday'))
+    except Exception:
+        _prefer_yq = True
+
+    # Helper: yahooquery block
+    def _try_yahooquery():
+        try:
+            from yahooquery import Ticker as _YQTicker
+            yq = _YQTicker(ticker)
+            if period:
+                yq_df = yq.history(period=period, interval=_interval)
+            else:
+                yq_df = yq.history(start=start, end=end, interval=_interval)
+            if yq_df is None or yq_df.empty:
+                return None
+            # Flatten MultiIndex to DatetimeIndex if needed
+            if isinstance(yq_df.index, _pd.MultiIndex):
+                if 'date' in yq_df.index.names:
+                    yq_df = yq_df.reset_index().set_index('date')
+                else:
+                    yq_df = yq_df.reset_index()
+            if not isinstance(yq_df.index, _pd.DatetimeIndex) and 'date' in yq_df.columns:
+                yq_df['date'] = _pd.to_datetime(yq_df['date'])
+                yq_df = yq_df.set_index('date')
+            rename = {
+                "open": "Open","high": "High","low": "Low","close": "Close",
+                "adjclose": "Adj Close","adj_close": "Adj Close","volume": "Volume",
+            }
+            yq_df = yq_df.rename(columns=lambda c: rename.get(str(c).lower(), str(c).title()))
+            keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in yq_df.columns]
+            if keep:
+                yq_df = yq_df[keep]
+            try:
+                st.session_state['last_fetch_provider'] = 'yahooquery'
+            except Exception:
+                pass
+            return yq_df
+        except Exception as e:
+            try:
+                st.session_state['last_fetch_errors'].append(f"yahooquery: {e}")
+            except Exception:
+                pass
+            return None
+
+    # 1) Preferred provider for intraday: yahooquery first if selected
+    if _prefer_yq:
+        yq_df = _try_yahooquery()
+        if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
+            return yq_df
+
+    # 2) yfinance with small retries
     for attempt in range(3):
         try:
             if period:
-                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+                df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=False, threads=False)
             else:
-                df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
+                df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=False, threads=False)
             if isinstance(df, _pd.DataFrame) and not df.empty:
+                try:
+                    st.session_state['last_fetch_provider'] = 'yfinance'
+                except Exception:
+                    pass
                 return df
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                st.session_state['last_fetch_errors'].append(f"yfinance attempt {attempt+1} (auto_adjust=False): {e}")
+            except Exception:
+                pass
         _sleep(0.6 * (attempt + 1))
 
     # Retry with auto_adjust=True once
     try:
         if period:
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+            df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=True, threads=False)
         else:
-            df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=True)
+            df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=True, threads=False)
         if isinstance(df, _pd.DataFrame) and not df.empty:
             return df
+    except Exception as e:
+        try:
+            st.session_state['last_fetch_errors'].append(f"yfinance (auto_adjust=True): {e}")
+        except Exception:
+            pass
+
+    # 3) yahooquery fallback if not tried first or if earlier paths failed
+    yq_df = _try_yahooquery()
+    if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
+        if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
+            try:
+                st.session_state['last_fetch_provider'] = 'yahooquery'
+            except Exception:
+                pass
+        return yq_df
+
+    # 3) Stooq daily fallback via pandas-datareader (only for 1d)
+    try:
+        if _interval == '1d':
+            try:
+                from pandas_datareader import data as _pdr
+            except Exception as e:
+                try:
+                    st.session_state['last_fetch_errors'].append(f"pandas-datareader not available for Stooq fallback: {e}")
+                except Exception:
+                    pass
+                return _pd.DataFrame()
+
+            # Determine date range
+            _start = None
+            _end = None
+            try:
+                if start and end:
+                    _start = _pd.to_datetime(start)
+                    _end = _pd.to_datetime(end)
+                elif period:
+                    now = _pd.Timestamp.utcnow().normalize()
+                    per_map = {
+                        '7d': 7, '14d': 14, '30d': 30, '60d': 60, '90d': 90,
+                        '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365, '2y': 730, '5y': 1825, '10y': 3650, 'max': 36500
+                    }
+                    days = per_map.get(str(period).lower(), 365)
+                    _start = now - _pd.Timedelta(days=days)
+                    _end = now + _pd.Timedelta(days=1)
+                else:
+                    _end = _pd.Timestamp.utcnow().normalize() + _pd.Timedelta(days=1)
+                    _start = _end - _pd.Timedelta(days=365)
+            except Exception:
+                pass
+
+            sym = str(ticker).strip().upper()
+            stooq_symbol = sym + '.US' if sym.isalpha() else sym
+            try:
+                stq = _pdr.DataReader(stooq_symbol, 'stooq', start=_start, end=_end)
+                if isinstance(stq, _pd.DataFrame) and not stq.empty:
+                    stq = stq.sort_index()
+                    # ensure yahoo-like column casing
+                    stq = stq.rename(columns={
+                        'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'
+                    })
+                    try:
+                        st.session_state['last_fetch_provider'] = 'stooq'
+                    except Exception:
+                        pass
+                    return stq
+            except Exception as e:
+                try:
+                    st.session_state['last_fetch_errors'].append(f"stooq fallback: {e}")
+                except Exception:
+                    pass
     except Exception:
         pass
 
-    # 2) yahooquery fallback (if installed)
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _fetch_ohlc_cached(
+    ticker: str,
+    *,
+    interval: str,
+    period: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    cache_buster: Optional[str] = None,
+):
+    # cache_buster participates in cache key but is unused otherwise
+    return _fetch_ohlc_uncached(ticker, interval=interval, period=period, start=start, end=end)
+
+
+def fetch_ohlc_with_fallback(
+    ticker: str,
+    *,
+    interval: str,
+    period: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """Cached fetch that avoids caching empty results by retrying with a cache-buster."""
     try:
-        from yahooquery import Ticker as _YQTicker
-        yq = _YQTicker(ticker)
-        if period:
-            yq_df = yq.history(period=period, interval=interval)
-        else:
-            yq_df = yq.history(start=start, end=end, interval=interval)
-
-        if yq_df is None or yq_df.empty:
-            return _pd.DataFrame()
-
-        # Flatten MultiIndex to DatetimeIndex if needed
-        if isinstance(yq_df.index, _pd.MultiIndex):
-            if 'date' in yq_df.index.names:
-                yq_df = yq_df.reset_index().set_index('date')
-            else:
-                yq_df = yq_df.reset_index()
-        if not isinstance(yq_df.index, _pd.DatetimeIndex) and 'date' in yq_df.columns:
-            yq_df['date'] = _pd.to_datetime(yq_df['date'])
-            yq_df = yq_df.set_index('date')
-
-        rename = {
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "adjclose": "Adj Close",
-            "adj_close": "Adj Close",
-            "volume": "Volume",
-        }
-        yq_df = yq_df.rename(columns=lambda c: rename.get(str(c).lower(), str(c).title()))
-        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in yq_df.columns]
-        if keep:
-            yq_df = yq_df[keep]
-        return yq_df
+        force = bool(st.session_state.get('force_refresh'))
     except Exception:
-        return _pd.DataFrame()
+        force = False
+    first_buster = (str(time.time()) if force else None)
+    df = _fetch_ohlc_cached(ticker, interval=interval, period=period, start=start, end=end, cache_buster=first_buster)
+    try:
+        import pandas as _pd
+        is_empty = (df is None) or (isinstance(df, _pd.DataFrame) and df.empty)
+    except Exception:
+        is_empty = df is None
+    if not is_empty:
+        return df
+    # Avoid returning a cached empty; retry once with a unique cache key
+    buster = str(time.time())
+    return _fetch_ohlc_cached(ticker, interval=interval, period=period, start=start, end=end, cache_buster=buster)
 
 # --- Anchored VWAP ---
 def anchored_vwap(df: pd.DataFrame, anchor_idx: int = 0, price_col: str = "Close", vol_col: str = "Volume") -> pd.Series:
@@ -496,8 +646,56 @@ with tab1:
                 e_inclusive = (e + timedelta(days=1)).isoformat()
                 df = fetch_ohlc_with_fallback(ticker, interval=interval, start=s.isoformat(), end=e_inclusive)
 
+                # Daily-specific resilience: widen window if empty, try Ticker().history, then period fallback
+                if (df is None or df.empty) and interval == "1d":
+                    s_wide = (s - timedelta(days=3)).isoformat()
+                    e_wide_inclusive = (e + timedelta(days=3 + 1)).isoformat()
+                    df = fetch_ohlc_with_fallback(ticker, interval=interval, start=s_wide, end=e_wide_inclusive)
+                    # Try direct Ticker().history as another path (sometimes succeeds when download() fails)
+                    if (df is None or df.empty):
+                        try:
+                            tkr = yf.Ticker(ticker)
+                            df_hist = tkr.history(start=s.isoformat(), end=e_inclusive, interval="1d", auto_adjust=False)
+                            if isinstance(df_hist, pd.DataFrame) and not df_hist.empty:
+                                df = df_hist
+                        except Exception as e:
+                            try:
+                                st.session_state['last_fetch_errors'].append(f"yfinance Ticker.history: {e}")
+                            except Exception:
+                                pass
+                    if df is None or df.empty:
+                        span_days = (e - s).days + 1
+                        period_map = [(7, "7d"), (31, "1mo"), (93, "3mo"), (183, "6mo"), (365, "1y"), (730, "2y")]
+                        sel_period = "1y"
+                        for lim, per in period_map:
+                            if span_days <= lim:
+                                sel_period = per
+                                break
+                        df = fetch_ohlc_with_fallback(ticker, interval=interval, period=sel_period)
+                    # Final safety: fetch full history and slice
+                    if df is None or df.empty:
+                        try:
+                            full = fetch_ohlc_with_fallback(ticker, interval="1d", period="max")
+                            if isinstance(full, pd.DataFrame) and not full.empty and isinstance(full.index, pd.DatetimeIndex):
+                                df = full[(full.index.date >= s) & (full.index.date <= e)]
+                        except Exception as e:
+                            try:
+                                st.session_state['last_fetch_errors'].append(f"max-period slice fallback: {e}")
+                            except Exception:
+                                pass
+
             if df is None or df.empty:
-                st.warning(f"No data for {ticker} @ interval={interval}. Tried yfinance and yahooquery.")
+                details = None
+                try:
+                    errs = st.session_state.get('last_fetch_errors')
+                    if errs:
+                        details = " | Details: " + " | ".join(errs[-3:])
+                except Exception:
+                    pass
+                msg = f"No data for {ticker} @ interval={interval}. Tried yfinance and yahooquery."
+                if details:
+                    msg += details
+                st.warning(msg)
                 st.stop()
 
             df = normalize_ohlcv(df)
@@ -674,7 +872,13 @@ with tab1:
                     style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
 
                     st.plotly_chart(fig, use_container_width=True)
-                    st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}")
+                    provider = None
+                    try:
+                        provider = st.session_state.get('last_fetch_provider')
+                    except Exception:
+                        pass
+                    src = f" | Source: {provider}" if provider else ""
+                    st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}{src}")
         except Exception as e:
             st.error(f"Error fetching or plotting data: {e}")
 # --- Black-Scholes Delta function ---
