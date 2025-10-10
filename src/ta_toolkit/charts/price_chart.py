@@ -138,7 +138,7 @@ def plot_candles_with_signal(
         # --- Final layout styling ---
     dark_mode = template == "plotly_dark"
 
-        dark_mode = template == "plotly_dark"
+    dark_mode = template == "plotly_dark"
 
     fig.update_layout(
         title=f"{ticker} — Price, Signals & Indicators",
