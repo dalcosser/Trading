@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 import math
 import yfinance as yf
 import time
+import os
 from typing import Optional
 try:
     import pandas_ta as pta  # for candlestick pattern detection
@@ -249,6 +250,11 @@ with st.sidebar:
         st.session_state['prefer_yq_intraday'] = prefer_yq_intraday
     except Exception:
         pass
+    use_polygon = st.checkbox("Use Polygon if key present", value=True)
+    polygon_key_input = st.text_input("Polygon API Key (optional)", value="", type="password")
+    st.session_state['use_polygon'] = use_polygon
+    if polygon_key_input:
+        st.session_state['polygon_api_key'] = polygon_key_input.strip()
 
 # ---------------- Helpers (chart) ----------------
 TARGETS = {"open", "high", "low", "close", "adj close", "adj_close", "adjclose", "volume"}
@@ -286,6 +292,39 @@ def _fetch_ohlc_uncached(
         _prefer_yq = bool(st.session_state.get('prefer_yq_intraday'))
     except Exception:
         _prefer_yq = True
+
+    # Helper: Polygon first if configured
+    def _try_polygon():
+        try:
+            want_poly = bool(st.session_state.get('use_polygon', True))
+            api_key = st.session_state.get('polygon_api_key') or os.getenv('POLYGON_API_KEY')
+        except Exception:
+            want_poly, api_key = True, os.getenv('POLYGON_API_KEY')
+        if not want_poly or not api_key:
+            return None
+        try:
+            try:
+                from src.data_providers.polygon_fetch import fetch_polygon_ohlc as _poly_fetch  # type: ignore
+            except Exception:
+                try:
+                    from polygon_fetch import fetch_polygon_ohlc as _poly_fetch  # type: ignore
+                except Exception:
+                    _poly_fetch = None
+            if _poly_fetch is None:
+                return None
+            dfp = _poly_fetch(ticker, interval=_interval, period=period, start=start, end=end, api_key=api_key)
+            if dfp is not None and not dfp.empty:
+                try:
+                    st.session_state['last_fetch_provider'] = 'polygon'
+                except Exception:
+                    pass
+                return dfp
+        except Exception as e:
+            try:
+                st.session_state['last_fetch_errors'].append(f"polygon: {e}")
+            except Exception:
+                pass
+        return None
 
     # Helper: yahooquery block
     def _try_yahooquery():
@@ -327,13 +366,18 @@ def _fetch_ohlc_uncached(
                 pass
             return None
 
-    # 1) Preferred provider for intraday: yahooquery first if selected
+    # 1) Polygon first if available
+    poly_df = _try_polygon()
+    if isinstance(poly_df, _pd.DataFrame) and not poly_df.empty:
+        return poly_df
+
+    # 2) Preferred provider for intraday: yahooquery first if selected
     if _prefer_yq:
         yq_df = _try_yahooquery()
         if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
             return yq_df
 
-    # 2) yfinance with small retries
+    # 3) yfinance with small retries
     for attempt in range(3):
         try:
             if period:
@@ -692,7 +736,7 @@ with tab1:
                         details = " | Details: " + " | ".join(errs[-3:])
                 except Exception:
                     pass
-                msg = f"No data for {ticker} @ interval={interval}. Tried yfinance and yahooquery."
+                msg = f"No data for {ticker} @ interval={interval}. Tried polygon, yfinance, and yahooquery."
                 if details:
                     msg += details
                 st.warning(msg)
