@@ -8,6 +8,7 @@ import math
 import yfinance as yf
 import time
 import os
+import json
 from typing import Optional
 try:
     import pandas_ta as pta  # for candlestick pattern detection
@@ -184,7 +185,7 @@ with st.sidebar:
             end = st.date_input("End", value=date.today())
 
 # Tabs
-tab1, tab2 = st.tabs(["📊 Chart", "🧾 Options"])
+tab1, tab2, tab3 = st.tabs(["📊 Chart", "🧾 Options", "📺 TradingView"])
 
 # ---------------- Chart tab controls ----------------
 with st.sidebar:
@@ -245,16 +246,28 @@ with st.sidebar:
         st.session_state['force_refresh'] = force_fresh
     except Exception:
         pass
-    prefer_yq_intraday = st.checkbox("Prefer YahooQuery (all intervals)", value=True)
-    try:
-        st.session_state['prefer_yq_intraday'] = prefer_yq_intraday
-    except Exception:
-        pass
     use_polygon = st.checkbox("Use Polygon if key present", value=True)
     polygon_key_input = st.text_input("Polygon API Key (optional)", value="", type="password")
     st.session_state['use_polygon'] = use_polygon
     if polygon_key_input:
         st.session_state['polygon_api_key'] = polygon_key_input.strip()
+
+    # Diagnostics (key detection + last source)
+    try:
+        _poly_key = st.session_state.get('polygon_api_key')
+        if not _poly_key:
+            try:
+                if hasattr(st, 'secrets') and ('POLYGON_API_KEY' in st.secrets):
+                    _poly_key = st.secrets['POLYGON_API_KEY']
+            except Exception:
+                pass
+        if not _poly_key:
+            _poly_key = os.getenv('POLYGON_API_KEY')
+        _last_src = st.session_state.get('last_fetch_provider', '-')
+        st.markdown("### Diagnostics")
+        st.caption(f"Polygon key detected: {bool(_poly_key)} | Last source: {_last_src}")
+    except Exception:
+        pass
 
 # ---------------- Helpers (chart) ----------------
 TARGETS = {"open", "high", "low", "close", "adj close", "adj_close", "adjclose", "volume"}
@@ -266,6 +279,79 @@ def best_period_for(interval_str: str, desired: Optional[str]) -> str:
     if interval_str in {"5m", "15m", "30m", "60m", "1h"}:
         return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
     return desired or "1y"
+
+# --- Symbol normalization (indices and futures continuous contracts) ---
+FUTURES_CONTINUOUS = {
+    # Equity index futures (CME)
+    "ES", "NQ", "YM", "RTY",
+    # Rates (CME)
+    "ZN", "ZB", "ZF", "ZT",
+    # Energies (NYMEX)
+    "CL", "NG", "RB", "HO", "BZ", "BRN",
+    # Metals (COMEX)
+    "GC", "SI", "HG", "PA", "PL",
+    # Ags (CBOT)
+    "ZC", "ZS", "ZW", "ZM", "ZL",
+    # Softs (ICE)
+    "KC", "SB", "CC", "CT", "OJ",
+}
+
+def normalize_input_symbol(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if s.startswith("^"):
+        return s  # caret indices handled downstream
+    if "=F" in s or ":" in s:
+        return s  # already explicit
+    root = s.split()[0]
+    if root in FUTURES_CONTINUOUS:
+        return root + "=F"  # map to Yahoo continuous contract
+    return s
+
+# --- Futures specific-contract parser (e.g., ESZ24, CLX2024) ---
+_MONTH_MAP = {
+    'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+    'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+}
+
+_FUTURES_SUFFIX = {
+    # Exchange code suffix as used by Yahoo
+    # CME group equity index
+    'ES': 'CME', 'NQ': 'CME', 'RTY': 'CME', 'YM': 'CBT',
+    # Treasuries (CBOT)
+    'ZN': 'CBT', 'ZB': 'CBT', 'ZF': 'CBT', 'ZT': 'CBT',
+    # Energies (NYMEX)
+    'CL': 'NYM', 'NG': 'NYM', 'RB': 'NYM', 'HO': 'NYM', 'BZ': 'NYM', 'BRN': 'NYM',
+    # Metals (COMEX/NYMEX)
+    'GC': 'CMX', 'SI': 'CMX', 'HG': 'CMX', 'PA': 'NYM', 'PL': 'NYM',
+    # Ags (CBOT)
+    'ZC': 'CBT', 'ZS': 'CBT', 'ZW': 'CBT', 'ZM': 'CBT', 'ZL': 'CBT',
+    # Softs (ICE US)
+    'KC': 'NYB', 'SB': 'NYB', 'CC': 'NYB', 'CT': 'NYB', 'OJ': 'NYB',
+}
+
+def build_futures_contract_candidates(sym: str):
+    s = (sym or '').strip().upper()
+    # Pattern: ROOT + MONTH_LETTER + YY or YYYY, e.g., ESZ24, CLX2024
+    import re
+    m = re.fullmatch(r"([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2}|\d{4})", s)
+    if not m:
+        return None
+    root, mon, year = m.group(1), m.group(2), m.group(3)
+    yy = year[-2:]
+    yyyy = ("20" + yy) if len(year) == 2 else year
+    suffix = _FUTURES_SUFFIX.get(root)
+    candidates = []
+    # Yahoo with exchange suffix
+    if suffix:
+        candidates.append(f"{root}{mon}{yy}.{suffix}")
+    # Yahoo without suffix
+    candidates.append(f"{root}{mon}{yy}")
+    # Continuous fallback
+    candidates.append(f"{root}=F")
+    # Polygon-style candidates (best-effort)
+    candidates.append(f"C:{root}{mon}{yyyy}")
+    candidates.append(f"{root}{mon}{yyyy}")
+    return candidates
 
 def _fetch_ohlc_uncached(
     ticker: str,
@@ -287,20 +373,24 @@ def _fetch_ohlc_uncached(
     except Exception:
         pass
 
-    # Decide order for providers
-    try:
-        _prefer_yq = bool(st.session_state.get('prefer_yq_intraday'))
-    except Exception:
-        _prefer_yq = True
+    # Decide order for providers: Polygon -> yfinance -> yahooquery -> Stooq(1d)
 
     # Helper: Polygon first if configured
     def _try_polygon():
+        # Always use Polygon when a key is available (sidebar/session, st.secrets, or env)
         try:
-            want_poly = bool(st.session_state.get('use_polygon', True))
-            api_key = st.session_state.get('polygon_api_key') or os.getenv('POLYGON_API_KEY')
+            api_key = st.session_state.get('polygon_api_key')
+            if not api_key:
+                try:
+                    if hasattr(st, 'secrets') and ('POLYGON_API_KEY' in st.secrets):
+                        api_key = st.secrets['POLYGON_API_KEY']
+                except Exception:
+                    pass
+            if not api_key:
+                api_key = os.getenv('POLYGON_API_KEY')
         except Exception:
-            want_poly, api_key = True, os.getenv('POLYGON_API_KEY')
-        if not want_poly or not api_key:
+            api_key = os.getenv('POLYGON_API_KEY')
+        if not api_key:
             return None
         try:
             try:
@@ -371,13 +461,7 @@ def _fetch_ohlc_uncached(
     if isinstance(poly_df, _pd.DataFrame) and not poly_df.empty:
         return poly_df
 
-    # 2) Preferred provider for intraday: yahooquery first if selected
-    if _prefer_yq:
-        yq_df = _try_yahooquery()
-        if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
-            return yq_df
-
-    # 3) yfinance with small retries
+    # 2) yfinance with small retries
     for attempt in range(3):
         try:
             if period:
@@ -411,7 +495,7 @@ def _fetch_ohlc_uncached(
         except Exception:
             pass
 
-    # 3) yahooquery fallback if not tried first or if earlier paths failed
+    # 3) yahooquery fallback
     yq_df = _try_yahooquery()
     if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
         if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
@@ -680,25 +764,45 @@ with tab1:
                     return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
                 return desired or "1y"
 
+            # Normalize symbol for futures continuous aliases (ES -> ES=F, etc.)
+            # and build candidate list for specific contracts (e.g., ESZ24)
+            contract_candidates = build_futures_contract_candidates(ticker)
+            if contract_candidates:
+                fetch_tickers = contract_candidates
+            else:
+                fetch_tickers = [normalize_input_symbol(ticker)]
+
             if intraday:
                 p = best_period_for(interval, str(period))
-                df = fetch_ohlc_with_fallback(ticker, interval=interval, period=p)
+                df = None
+                for tk in fetch_tickers:
+                    df = fetch_ohlc_with_fallback(tk, interval=interval, period=p)
+                    if df is not None and not df.empty:
+                        break
             else:
                 # Ensure valid date order and include selected end date (Yahoo end is exclusive)
                 s = min(pd.to_datetime(start), pd.to_datetime(end)).date()
                 e = max(pd.to_datetime(start), pd.to_datetime(end)).date()
                 e_inclusive = (e + timedelta(days=1)).isoformat()
-                df = fetch_ohlc_with_fallback(ticker, interval=interval, start=s.isoformat(), end=e_inclusive)
+                df = None
+                for tk in fetch_tickers:
+                    df = fetch_ohlc_with_fallback(tk, interval=interval, start=s.isoformat(), end=e_inclusive)
+                    if df is not None and not df.empty:
+                        break
 
                 # Daily-specific resilience: widen window if empty, try Ticker().history, then period fallback
                 if (df is None or df.empty) and interval == "1d":
                     s_wide = (s - timedelta(days=3)).isoformat()
                     e_wide_inclusive = (e + timedelta(days=3 + 1)).isoformat()
-                    df = fetch_ohlc_with_fallback(ticker, interval=interval, start=s_wide, end=e_wide_inclusive)
+                    if df is None or df.empty:
+                        for tk in fetch_tickers:
+                            df = fetch_ohlc_with_fallback(tk, interval=interval, start=s_wide, end=e_wide_inclusive)
+                            if df is not None and not df.empty:
+                                break
                     # Try direct Ticker().history as another path (sometimes succeeds when download() fails)
                     if (df is None or df.empty):
                         try:
-                            tkr = yf.Ticker(ticker)
+                            tkr = yf.Ticker(fetch_tickers[0])
                             df_hist = tkr.history(start=s.isoformat(), end=e_inclusive, interval="1d", auto_adjust=False)
                             if isinstance(df_hist, pd.DataFrame) and not df_hist.empty:
                                 df = df_hist
@@ -715,11 +819,18 @@ with tab1:
                             if span_days <= lim:
                                 sel_period = per
                                 break
-                        df = fetch_ohlc_with_fallback(ticker, interval=interval, period=sel_period)
+                        for tk in fetch_tickers:
+                            df = fetch_ohlc_with_fallback(tk, interval=interval, period=sel_period)
+                            if df is not None and not df.empty:
+                                break
                     # Final safety: fetch full history and slice
                     if df is None or df.empty:
                         try:
-                            full = fetch_ohlc_with_fallback(ticker, interval="1d", period="max")
+                            full = None
+                            for tk in fetch_tickers:
+                                full = fetch_ohlc_with_fallback(tk, interval="1d", period="max")
+                                if full is not None and not full.empty:
+                                    break
                             if isinstance(full, pd.DataFrame) and not full.empty and isinstance(full.index, pd.DatetimeIndex):
                                 df = full[(full.index.date >= s) & (full.index.date <= e)]
                         except Exception as e:
@@ -747,12 +858,11 @@ with tab1:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            # Determine VWAP anchor index if enabled (no re-download; use df already fetched)
+            # Determine VWAP anchor index from input (overlay not required for backtest)
             vwap_idx = None
-            if show_vwap and vwap_anchor:
+            if vwap_anchor:
                 try:
                     anchor_dt = pd.to_datetime(vwap_anchor)
-                    # find nearest match in index if possible
                     if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
                         pos = df.index.get_indexer([anchor_dt], method='nearest')
                         vwap_idx = int(pos[0]) if pos.size and pos[0] != -1 else None
@@ -889,28 +999,25 @@ with tab1:
 
                     # --- Run backtest if enabled and strategy is selected ---
                     trades = []
-                    if enable_backtest and strategy == "Price crosses above VWAP" and show_vwap and vwap_idx is not None:
-                        vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                        trades = backtest_price_crosses_vwap(close, vwap_series)
-                        # Plot buy/sell markers
-                        for t in trades:
-                            fig.add_trace(go.Scatter(
-                                x=[t['entry_time']], y=[t['entry_price']],
-                                mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=14,
-                                name="Buy"
-                            ), row=1, col=1)
-                            fig.add_trace(go.Scatter(
-                                x=[t['exit_time']], y=[t['exit_price']],
-                                mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=14,
-                                name="Sell"
-                            ), row=1, col=1)
-                        # Show summary table
-                        if trades:
-                            trade_df = pd.DataFrame(trades)
-                            trade_df['holding_period'] = (trade_df['exit_time'] - trade_df['entry_time']).astype(str)
-                            st.subheader("Backtest Trades")
-                            st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
-                            st.write(f"**Total Trades:** {len(trade_df)}  |  **Total P&L:** {trade_df['pnl'].sum():.2f}  |  **Win Rate:** {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
+                    backtest_missing_anchor = False
+                    if enable_backtest and strategy == "Price crosses above VWAP":
+                        if vwap_idx is None:
+                            backtest_missing_anchor = True
+                        else:
+                            vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
+                            trades = backtest_price_crosses_vwap(close, vwap_series)
+                            # Plot buy/sell markers on chart
+                            for t in trades:
+                                fig.add_trace(go.Scatter(
+                                    x=[t['entry_time']], y=[t['entry_price']],
+                                    mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=14,
+                                    name="Buy"
+                                ), row=1, col=1)
+                                fig.add_trace(go.Scatter(
+                                    x=[t['exit_time']], y=[t['exit_price']],
+                                    mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=14,
+                                    name="Sell"
+                                ), row=1, col=1)
 
                     fig.update_layout(title=f"{ticker} — {interval}", xaxis_rangeslider_visible=False, height=base_height)
                     style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
@@ -923,8 +1030,96 @@ with tab1:
                         pass
                     src = f" | Source: {provider}" if provider else ""
                     st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}{src}")
+
+                    # Optional: TradingView fallback expander (if the TV tab isn't visible in your setup)
+                    with st.expander("TradingView (embedded)"):
+                        _tv_interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "60m": "60", "1d": "D"}
+                        tv_interval = _tv_interval_map.get(interval, "D")
+                        tv_theme = "dark" if template == "plotly_dark" else "light"
+                        tv_symbol = ticker
+                        cfg = {
+                            "allow_symbol_change": True,
+                            "calendar": False,
+                            "details": False,
+                            "hide_side_toolbar": True,
+                            "hide_top_toolbar": False,
+                            "hide_legend": False,
+                            "hide_volume": False,
+                            "hotlist": False,
+                            "interval": tv_interval,
+                            "locale": "en",
+                            "save_image": True,
+                            "style": "1",
+                            "symbol": tv_symbol,
+                            "theme": tv_theme,
+                            "timezone": "Etc/UTC",
+                            "autosize": True,
+                            "withdateranges": False,
+                            "studies": [],
+                        }
+                        html_code = f"""
+                        <div class=\"tradingview-widget-container\" style=\"height:{base_height}px;width:100%\">
+                          <div class=\"tradingview-widget-container__widget\" style=\"height:100%;width:100%\"></div>
+                          <script type=\"text/javascript\" src=\"https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js\" async>
+                          {json.dumps(cfg)}
+                          </script>
+                        </div>
+                        """
+                        st.components.v1.html(html_code, height=base_height+20, scrolling=False)
+
+                    # --- Backtest results section (always shows below chart when enabled) ---
+                    if enable_backtest and strategy == "Price crosses above VWAP":
+                        st.subheader("Backtest Trades")
+                        if backtest_missing_anchor:
+                            st.info("Set Anchored VWAP and provide an anchor to run this backtest.")
+                        else:
+                            if trades:
+                                trade_df = pd.DataFrame(trades)
+                                trade_df['holding_period'] = (trade_df['exit_time'] - trade_df['entry_time']).astype(str)
+                                st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
+                                st.write(f"Total Trades: {len(trade_df)}  |  Total P&L: {trade_df['pnl'].sum():.2f}  |  Win Rate: {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
+                            else:
+                                st.caption("No signals generated for the selected range and settings.")
         except Exception as e:
             st.error(f"Error fetching or plotting data: {e}")
+
+# ---------------- TRADINGVIEW TAB ----------------
+with tab3:
+    st.subheader("TradingView (embedded)")
+    # Map our interval to TradingView interval
+    _tv_interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "60m": "60", "1d": "D"}
+    tv_interval = _tv_interval_map.get(interval, "D")
+    tv_theme = "dark" if template == "plotly_dark" else "light"
+    tv_symbol = ticker  # let TV resolve; user can change in-widget
+    cfg = {
+        "allow_symbol_change": True,
+        "calendar": False,
+        "details": False,
+        "hide_side_toolbar": True,
+        "hide_top_toolbar": False,
+        "hide_legend": False,
+        "hide_volume": False,
+        "hotlist": False,
+        "interval": tv_interval,
+        "locale": "en",
+        "save_image": True,
+        "style": "1",
+        "symbol": tv_symbol,
+        "theme": tv_theme,
+        "timezone": "Etc/UTC",
+        "autosize": True,
+        "withdateranges": False,
+        "studies": [],
+    }
+    html_code = f"""
+    <div class="tradingview-widget-container" style="height:{base_height}px;width:100%">
+      <div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+      {json.dumps(cfg)}
+      </script>
+    </div>
+    """
+    st.components.v1.html(html_code, height=base_height+20, scrolling=False)
 # --- Black-Scholes Delta function ---
 def bs_delta(S, K, T, r, sigma, q, kind="call"):
     """
@@ -950,28 +1145,130 @@ def bs_delta(S, K, T, r, sigma, q, kind="call"):
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_expirations(ticker: str) -> list[str]:
+    """Fetch option expirations: Polygon -> yfinance -> yahooquery."""
+    # Polygon first (if key present)
+    try:
+        api_key = None
+        try:
+            api_key = st.session_state.get('polygon_api_key')
+            if not api_key and hasattr(st, 'secrets') and ('POLYGON_API_KEY' in st.secrets):
+                api_key = st.secrets['POLYGON_API_KEY']
+            if not api_key:
+                import os as _os
+                api_key = _os.getenv('POLYGON_API_KEY')
+        except Exception:
+            pass
+        if api_key:
+            try:
+                from src.data_providers.polygon_options import fetch_polygon_expirations as _poly_exps  # type: ignore
+            except Exception:
+                try:
+                    from polygon_options import fetch_polygon_expirations as _poly_exps  # type: ignore
+                except Exception:
+                    _poly_exps = None
+            if _poly_exps:
+                # map common caret indices to Polygon underlyings (e.g., ^GSPC -> SPX)
+                _t = ticker.strip().upper()
+                if _t.startswith('^'):
+                    _t = _t[1:]
+                exps = _poly_exps(_t, api_key=api_key)
+                if exps:
+                    return exps
+    except Exception:
+        pass
+    # yfinance
     try:
         t = yf.Ticker(ticker)
         exps = t.options or []
-        return exps
-    except Exception as e:
-        # Surface a clearer message than underlying JSON decode errors
-        raise RuntimeError(f"Failed to fetch expirations for {ticker}. Provider returned no/invalid data.") from e
+        if exps:
+            return exps
+    except Exception:
+        pass
+    # yahooquery fallback
+    try:
+        from yahooquery import Ticker as _YQTicker
+        yq = _YQTicker(ticker)
+        exps = yq.options or []
+        if isinstance(exps, dict):
+            exps = exps.get(ticker.upper(), []) or exps.get(ticker, [])
+        return exps or []
+    except Exception:
+        return []
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_chain(ticker: str, expiration: str):
+    """Fetch option chain for an expiration: Polygon -> yfinance -> yahooquery."""
+    import pandas as _pd
+    # Polygon first
+    try:
+        api_key = None
+        try:
+            api_key = st.session_state.get('polygon_api_key')
+            if not api_key and hasattr(st, 'secrets') and ('POLYGON_API_KEY' in st.secrets):
+                api_key = st.secrets['POLYGON_API_KEY']
+            if not api_key:
+                import os as _os
+                api_key = _os.getenv('POLYGON_API_KEY')
+        except Exception:
+            pass
+        if api_key:
+            try:
+                from src.data_providers.polygon_options import fetch_polygon_chain as _poly_chain  # type: ignore
+            except Exception:
+                try:
+                    from polygon_options import fetch_polygon_chain as _poly_chain  # type: ignore
+                except Exception:
+                    _poly_chain = None
+            if _poly_chain:
+                _t = ticker.strip().upper()
+                if _t.startswith('^'):
+                    _t = _t[1:]
+                calls, puts = _poly_chain(_t, expiration, api_key=api_key)
+                if isinstance(calls, _pd.DataFrame) and not calls.empty:
+                    return calls, puts
+    except Exception:
+        pass
+    # yfinance
     try:
         t = yf.Ticker(ticker)
         oc = t.option_chain(expiration)
         calls = oc.calls.copy()
         puts = oc.puts.copy()
-        # normalize column names
         calls.columns = [str(c).replace(' ', '_').lower() for c in calls.columns]
         puts.columns  = [str(c).replace(' ', '_').lower()  for c in puts.columns]
         return calls, puts
-    except Exception as e:
-        # yfinance sometimes returns empty/invalid responses; surface a clearer message
-        raise RuntimeError(f"Failed to fetch option chain for {ticker} @ {expiration}. Provider returned no/invalid data.") from e
+    except Exception:
+        pass
+    # yahooquery
+    try:
+        from yahooquery import Ticker as _YQTicker
+        yq = _YQTicker(ticker)
+        df = yq.option_chain(expiration)
+        if df is None or (isinstance(df, _pd.DataFrame) and df.empty):
+            return _pd.DataFrame(), _pd.DataFrame()
+        if not isinstance(df, _pd.DataFrame):
+            try:
+                df = _pd.DataFrame(df)
+            except Exception:
+                return _pd.DataFrame(), _pd.DataFrame()
+        df.columns = [str(c).replace(' ', '_').lower() for c in df.columns]
+        type_col = None
+        for c in ("option_type", "type", "contracttype"):
+            if c in df.columns:
+                type_col = c
+                break
+        calls = df.copy()
+        puts = df.copy()
+        if type_col:
+            calls = df[df[type_col].astype(str).str.lower().str.startswith('c')].copy()
+            puts  = df[df[type_col].astype(str).str.lower().str.startswith('p')].copy()
+        elif 'contractsymbol' in df.columns:
+            cs = df['contractsymbol'].astype(str)
+            calls = df[cs.str.contains('C', case=False, regex=False)].copy()
+            puts  = df[cs.str.contains('P', case=False, regex=False)].copy()
+        return calls, puts
+    except Exception:
+        return _pd.DataFrame(), _pd.DataFrame()
 
 def spot_price(ticker: str) -> float | None:
     try:
