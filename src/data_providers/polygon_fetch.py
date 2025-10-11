@@ -67,7 +67,8 @@ def fetch_polygon_ohlc(
     mult, span = INTERVAL_MAP.get(interval, (1, "day"))
     s, e = _date_range(period, start, end)
 
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker.upper()}/range/{mult}/{span}/{s}/{e}"
+    poly_ticker = _normalize_polygon_ticker(ticker)
+    url = f"https://api.polygon.io/v2/aggs/ticker/{poly_ticker}/range/{mult}/{span}/{s}/{e}"
     params = {"adjusted": str(bool(adjusted)).lower(), "sort": "asc", "limit": 50000, "apiKey": key}
     try:
         r = requests.get(url, params=params, timeout=20)
@@ -88,4 +89,24 @@ def fetch_polygon_ohlc(
         return out[keep]
     except Exception:
         return pd.DataFrame()
+INDEX_MAP = {
+    "^GSPC": "I:SPX",
+    "SPX": "I:SPX",
+    "^NDX": "I:NDX",
+    "NDX": "I:NDX",
+    "^DJI": "I:DJI",
+    "DJI": "I:DJI",
+    "^RUT": "I:RUT",
+    "RUT": "I:RUT",
+    "^VIX": "I:VIX",
+    "VIX": "I:VIX",
+}
 
+def _normalize_polygon_ticker(user_ticker: str) -> str:
+    t = (user_ticker or "").strip().upper()
+    if t in INDEX_MAP:
+        return INDEX_MAP[t]
+    if t.startswith("^"):
+        # Generic caret index -> try I:<symbol without ^>
+        return f"I:{t[1:]}"
+    return t
