@@ -939,12 +939,13 @@ with tab1:
 
                     # Add price labels to right side if enabled
                     def add_price_label(trace_name, y_val, color):
+                        # Place label just inside the plotting area so it's not clipped
                         fig.add_annotation(
-                            xref="paper", x=1.01, y=y_val,
-                            xanchor="left", yanchor="middle",
+                            xref="paper", x=0.995, y=y_val,
+                            xanchor="right", yanchor="middle",
                             text=f"{trace_name}: {y_val:.2f}",
                             font=dict(color=color, size=13),
-                            showarrow=False, align="left",
+                            showarrow=False, align="right",
                             bgcolor="#222" if template=="plotly_dark" else "#fff",
                             bordercolor=color, borderwidth=1, opacity=0.95
                         )
@@ -1108,8 +1109,22 @@ with tab1:
                             if trades:
                                 trade_df = pd.DataFrame(trades)
                                 trade_df['holding_period'] = (trade_df['exit_time'] - trade_df['entry_time']).astype(str)
-                                st.dataframe(trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']], use_container_width=True)
-                                st.write(f"Total Trades: {len(trade_df)}  |  Total P&L: {trade_df['pnl'].sum():.2f}  |  Win Rate: {100*sum(trade_df['pnl']>0)/len(trade_df):.1f}%")
+                                # KPI grid
+                                k1, k2, k3 = st.columns(3)
+                                total_trades = len(trade_df)
+                                total_pnl = float(trade_df['pnl'].sum())
+                                win_rate = float((trade_df['pnl'] > 0).mean() * 100.0)
+                                with k1:
+                                    st.metric("Total Trades", f"{total_trades}")
+                                with k2:
+                                    st.metric("Total P&L", f"{total_pnl:.2f}")
+                                with k3:
+                                    st.metric("Win Rate", f"{win_rate:.1f}%")
+                                # Trades grid
+                                st.dataframe(
+                                    trade_df[['entry_time','entry_price','exit_time','exit_price','pnl','holding_period']],
+                                    use_container_width=True,
+                                )
                             else:
                                 st.caption("No signals generated for the selected range and settings.")
         except Exception as e:
@@ -1165,9 +1180,23 @@ def bs_delta(S, K, T, r, sigma, q, kind="call"):
         from scipy.stats import norm
         return -math.exp(-q * T) * norm.cdf(-d1)
 
+def is_equity_symbol(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    if not s:
+        return False
+    if s.startswith('^'):
+        return False
+    if '=' in s or ':' in s:
+        return False
+    # crude: letters/digits up to 6 chars
+    return s.replace('.', '').isalnum() and len(s) <= 6
+
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_expirations(ticker: str) -> list[str]:
-    """Fetch option expirations: Polygon -> yfinance -> yahooquery."""
+def fetch_expirations(ticker: str, cache_buster: str | None = None) -> list[str]:
+    """Fetch option expirations: Polygon -> yfinance -> yahooquery. Records diagnostics in session."""
+    st.session_state['opt_errors'] = []
+    # Decide order: equities -> yahooquery → yfinance → polygon; others -> polygon → yfinance → yahooquery
+    eq = is_equity_symbol(ticker)
     # Polygon first (if key present)
     try:
         api_key = None
@@ -1189,38 +1218,49 @@ def fetch_expirations(ticker: str) -> list[str]:
                 except Exception:
                     _poly_exps = None
             if _poly_exps:
-                # map common caret indices to Polygon underlyings (e.g., ^GSPC -> SPX)
                 _t = ticker.strip().upper()
                 if _t.startswith('^'):
                     _t = _t[1:]
                 exps = _poly_exps(_t, api_key=api_key)
                 if exps:
+                    st.session_state['opt_last_provider'] = 'polygon'
                     return exps
-    except Exception:
-        pass
-    # yfinance
+                else:
+                    st.session_state['opt_errors'].append('polygon: no expirations returned')
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'polygon: {e}')
+    # yfinance (order depends on eq)
     try:
         t = yf.Ticker(ticker)
         exps = t.options or []
         if exps:
+            st.session_state['opt_last_provider'] = 'yfinance'
             return exps
-    except Exception:
-        pass
-    # yahooquery fallback
+        else:
+            st.session_state['opt_errors'].append('yfinance: empty options list')
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'yfinance: {e}')
+    # yahooquery (order depends on eq)
     try:
         from yahooquery import Ticker as _YQTicker
         yq = _YQTicker(ticker)
         exps = yq.options or []
         if isinstance(exps, dict):
             exps = exps.get(ticker.upper(), []) or exps.get(ticker, [])
+        if exps:
+            st.session_state['opt_last_provider'] = 'yahooquery'
+        else:
+            st.session_state['opt_errors'].append('yahooquery: empty options list')
         return exps or []
-    except Exception:
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'yahooquery: {e}')
         return []
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_chain(ticker: str, expiration: str):
-    """Fetch option chain for an expiration: Polygon -> yfinance -> yahooquery."""
+    """Fetch option chain for an expiration: Polygon -> yfinance -> yahooquery. Records diagnostics."""
     import pandas as _pd
+    st.session_state['opt_errors'] = st.session_state.get('opt_errors', [])
     # Polygon first
     try:
         api_key = None
@@ -1247,9 +1287,12 @@ def fetch_chain(ticker: str, expiration: str):
                     _t = _t[1:]
                 calls, puts = _poly_chain(_t, expiration, api_key=api_key)
                 if isinstance(calls, _pd.DataFrame) and not calls.empty:
+                    st.session_state['opt_last_provider'] = 'polygon'
                     return calls, puts
-    except Exception:
-        pass
+                else:
+                    st.session_state['opt_errors'].append('polygon: empty chain')
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'polygon: {e}')
     # yfinance
     try:
         t = yf.Ticker(ticker)
@@ -1258,20 +1301,23 @@ def fetch_chain(ticker: str, expiration: str):
         puts = oc.puts.copy()
         calls.columns = [str(c).replace(' ', '_').lower() for c in calls.columns]
         puts.columns  = [str(c).replace(' ', '_').lower()  for c in puts.columns]
+        st.session_state['opt_last_provider'] = 'yfinance'
         return calls, puts
-    except Exception:
-        pass
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'yfinance: {e}')
     # yahooquery
     try:
         from yahooquery import Ticker as _YQTicker
         yq = _YQTicker(ticker)
         df = yq.option_chain(expiration)
         if df is None or (isinstance(df, _pd.DataFrame) and df.empty):
+            st.session_state['opt_errors'].append('yahooquery: empty chain')
             return _pd.DataFrame(), _pd.DataFrame()
         if not isinstance(df, _pd.DataFrame):
             try:
                 df = _pd.DataFrame(df)
-            except Exception:
+            except Exception as e:
+                st.session_state['opt_errors'].append(f'yahooquery: {e}')
                 return _pd.DataFrame(), _pd.DataFrame()
         df.columns = [str(c).replace(' ', '_').lower() for c in df.columns]
         type_col = None
@@ -1288,8 +1334,10 @@ def fetch_chain(ticker: str, expiration: str):
             cs = df['contractsymbol'].astype(str)
             calls = df[cs.str.contains('C', case=False, regex=False)].copy()
             puts  = df[cs.str.contains('P', case=False, regex=False)].copy()
+        st.session_state['opt_last_provider'] = 'yahooquery'
         return calls, puts
-    except Exception:
+    except Exception as e:
+        st.session_state['opt_errors'].append(f'yahooquery: {e}')
         return _pd.DataFrame(), _pd.DataFrame()
 
 def spot_price(ticker: str) -> float | None:
@@ -1325,6 +1373,13 @@ with tab2:
                 exps = fetch_expirations(ticker)
                 if not exps:
                     st.warning("No options data available for this ticker.")
+                    try:
+                        diag = st.session_state.get('opt_errors') or []
+                        prov = st.session_state.get('opt_last_provider', '-')
+                        if diag:
+                            st.caption(f"Options diagnostics (last provider={prov}): {' | '.join(diag[-3:])}")
+                    except Exception:
+                        pass
                     st.stop()
                 st.session_state["opts_expirations"] = exps
 
@@ -1339,6 +1394,16 @@ with tab2:
 
             with st.spinner(f"Fetching chain for {sel}..."):
                 calls, puts = fetch_chain(ticker, sel)
+                if (calls is None or calls.empty) and (puts is None or puts.empty):
+                    st.warning("No option chain returned for this expiration.")
+                    try:
+                        diag = st.session_state.get('opt_errors') or []
+                        prov = st.session_state.get('opt_last_provider', '-')
+                        if diag:
+                            st.caption(f"Options diagnostics (last provider={prov}): {' | '.join(diag[-3:])}")
+                    except Exception:
+                        pass
+                    st.stop()
 
             # Add delta using BS with yfinance implied volatility if available
             S = spot_price(ticker)
@@ -1347,11 +1412,22 @@ with tab2:
 
             def add_delta(df: pd.DataFrame, kind: str) -> pd.DataFrame:
                 out = df.copy()
-                if S is None or T <= 0 or "implied_volatility" not in out.columns or "strike" not in out.columns:
+                # Resolve columns robustly
+                iv_col = None
+                for c in ("implied_volatility", "impliedvolatility", "iv", "impl_vol"):
+                    if c in out.columns:
+                        iv_col = c
+                        break
+                strike_col = None
+                for c in ("strike", "strike_price", "strikeprice", "k"):
+                    if c in out.columns:
+                        strike_col = c
+                        break
+                if S is None or T <= 0 or iv_col is None or strike_col is None:
                     out["delta"] = np.nan
                     return out
-                iv = pd.to_numeric(out["implied_volatility"], errors="coerce").fillna(np.nan).astype(float)
-                strikes = pd.to_numeric(out["strike"], errors="coerce").astype(float)
+                iv = pd.to_numeric(out[iv_col], errors="coerce").astype(float)
+                strikes = pd.to_numeric(out[strike_col], errors="coerce").astype(float)
                 deltas = []
                 for k, sig in zip(strikes, iv):
                     deltas.append(bs_delta(S, float(k), float(T), float(r_rate), float(sig or 0.0), float(q_div), kind))
@@ -1373,12 +1449,18 @@ with tab2:
             # moneyness tagging (uses spot S if available)
             def tag_filter(df: pd.DataFrame, kind: str) -> pd.DataFrame:
                 out = df.copy()
-                if S is not None and "strike" in out.columns:
-                    out["moneyness"] = (out["strike"] - S) / S
+                # find strike column
+                s_col = None
+                for c in ("strike", "strike_price", "strikeprice", "k"):
+                    if c in out.columns:
+                        s_col = c
+                        break
+                if S is not None and s_col is not None:
+                    out["moneyness"] = (out[s_col] - S) / S
                     if kind == "call":
-                        itm_mask = out["strike"] < S
+                        itm_mask = out[s_col] < S
                     else:
-                        itm_mask = out["strike"] > S
+                        itm_mask = out[s_col] > S
                     if moneyness == "OTM":
                         out = out[~itm_mask]
                     elif moneyness == "ITM":
