@@ -81,6 +81,11 @@ def apply_theme(choice: str) -> str:
         color: #6a6a6a !important;
         border: 1px solid #d0d0d0 !important;
       }
+
+      /* Ensure TradingView embed uses full width */
+      .tradingview-widget-container, .tradingview-widget-container__widget {
+        width: 100% !important;
+      }
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -279,6 +284,42 @@ def best_period_for(interval_str: str, desired: Optional[str]) -> str:
     if interval_str in {"5m", "15m", "30m", "60m", "1h"}:
         return desired if desired in {"5d", "7d", "14d", "30d", "60d"} else "30d"
     return desired or "1y"
+
+# --- TradingView symbol mapper (heuristic) ---
+def tv_symbol_for(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if ":" in s:
+        return s  # already namespaced
+    # Common indices
+    index_map = {
+        "^GSPC": "SP:SPX",
+        "SPX": "SP:SPX",
+        "^NDX": "NASDAQ:NDX",
+        "NDX": "NASDAQ:NDX",
+        "^DJI": "DJ:DJI",
+        "DJI": "DJ:DJI",
+        "^VIX": "CBOE:VIX",
+        "VIX": "CBOE:VIX",
+    }
+    if s in index_map:
+        return index_map[s]
+    if s.startswith("^"):
+        return s[1:]
+    # Common futures roots to TradingView continuous front contract
+    fut_map = {
+        "ES": "CME_MINI:ES1!", "NQ": "CME_MINI:NQ1!", "YM": "CBOT_MINI:YM1!", "RTY": "CME:RTY1!",
+        "CL": "NYMEX:CL1!", "NG": "NYMEX:NG1!", "RB": "NYMEX:RB1!", "HO": "NYMEX:HO1!",
+        "GC": "COMEX:GC1!", "SI": "COMEX:SI1!", "HG": "COMEX:HG1!",
+        "ZC": "CBOT:ZC1!", "ZS": "CBOT:ZS1!", "ZW": "CBOT:ZW1!", "ZM": "CBOT:ZM1!", "ZL": "CBOT:ZL1!",
+        "KC": "ICEUS:KC1!", "SB": "ICEUS:SB1!", "CC": "ICEUS:CC1!", "CT": "ICEUS:CT1!", "OJ": "ICEUS:OJ1!",
+    }
+    root = s.split("=")[0]
+    if root in fut_map:
+        return fut_map[root]
+    # Default to NASDAQ namespace for plain equities; users can change in-widget
+    if s.isalpha() and 1 <= len(s) <= 5:
+        return f"NASDAQ:{s}"
+    return s
 
 # --- Symbol normalization (indices and futures continuous contracts) ---
 FUTURES_CONTINUOUS = {
@@ -1036,34 +1077,25 @@ with tab1:
                         _tv_interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "60m": "60", "1d": "D"}
                         tv_interval = _tv_interval_map.get(interval, "D")
                         tv_theme = "dark" if template == "plotly_dark" else "light"
-                        tv_symbol = ticker
-                        cfg = {
-                            "allow_symbol_change": True,
-                            "calendar": False,
-                            "details": False,
-                            "hide_side_toolbar": True,
-                            "hide_top_toolbar": False,
-                            "hide_legend": False,
-                            "hide_volume": False,
-                            "hotlist": False,
-                            "interval": tv_interval,
-                            "locale": "en",
-                            "save_image": True,
-                            "style": "1",
+                        tv_symbol = tv_symbol_for(ticker)
+                        tv_cfg = {
+                            "container_id": "tv_container_exp",
                             "symbol": tv_symbol,
-                            "theme": tv_theme,
+                            "interval": tv_interval,
                             "timezone": "Etc/UTC",
-                            "autosize": True,
-                            "withdateranges": False,
+                            "theme": tv_theme,
+                            "style": "1",
+                            "hide_side_toolbar": True,
+                            "allow_symbol_change": True,
                             "studies": [],
+                            "autosize": True,
                         }
                         html_code = f"""
-                        <div class=\"tradingview-widget-container\" style=\"height:{base_height}px;width:100%\">
-                          <div class=\"tradingview-widget-container__widget\" style=\"height:100%;width:100%\"></div>
-                          <script type=\"text/javascript\" src=\"https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js\" async>
-                          {json.dumps(cfg)}
-                          </script>
-                        </div>
+                        <div id=\"tv_container_exp\" style=\"height:{base_height}px; width:100%\"></div>
+                        <script src=\"https://s3.tradingview.com/tv.js\"></script>
+                        <script type=\"text/javascript\">
+                          new TradingView.widget({json.dumps(tv_cfg)});
+                        </script>
                         """
                         st.components.v1.html(html_code, height=base_height+20, scrolling=False)
 
@@ -1086,38 +1118,28 @@ with tab1:
 # ---------------- TRADINGVIEW TAB ----------------
 with tab3:
     st.subheader("TradingView (embedded)")
-    # Map our interval to TradingView interval
     _tv_interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "60m": "60", "1d": "D"}
     tv_interval = _tv_interval_map.get(interval, "D")
     tv_theme = "dark" if template == "plotly_dark" else "light"
-    tv_symbol = ticker  # let TV resolve; user can change in-widget
-    cfg = {
-        "allow_symbol_change": True,
-        "calendar": False,
-        "details": False,
-        "hide_side_toolbar": True,
-        "hide_top_toolbar": False,
-        "hide_legend": False,
-        "hide_volume": False,
-        "hotlist": False,
-        "interval": tv_interval,
-        "locale": "en",
-        "save_image": True,
-        "style": "1",
+    tv_symbol = tv_symbol_for(ticker)
+    tv_cfg = {
+        "container_id": "tv_container_tab",
         "symbol": tv_symbol,
-        "theme": tv_theme,
+        "interval": tv_interval,
         "timezone": "Etc/UTC",
-        "autosize": True,
-        "withdateranges": False,
+        "theme": tv_theme,
+        "style": "1",
+        "hide_side_toolbar": True,
+        "allow_symbol_change": True,
         "studies": [],
+        "autosize": True,
     }
     html_code = f"""
-    <div class="tradingview-widget-container" style="height:{base_height}px;width:100%">
-      <div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
-      {json.dumps(cfg)}
-      </script>
-    </div>
+    <div id="tv_container_tab" style="height:{base_height}px; width:100%"></div>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script type="text/javascript">
+      new TradingView.widget({json.dumps(tv_cfg)});
+    </script>
     """
     st.components.v1.html(html_code, height=base_height+20, scrolling=False)
 # --- Black-Scholes Delta function ---
