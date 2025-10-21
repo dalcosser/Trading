@@ -192,8 +192,9 @@ with st.sidebar:
             ema_selected = [p for p in ma_periods if st.checkbox(f"EMA {p}", value=(p in [21, 50]), key=f"ema_{p}")]
 
     st.markdown("### Lower Panels")
-    lower_options = ["RSI", "Stochastic %K/%D"]
-    lower_selected = st.multiselect("Add panels", options=lower_options, default=["RSI"])
+    lower_options = ["Volume", "RSI", "Stochastic %K/%D", "MACD (panel)"]
+    lower_selected = st.multiselect("Add panels", options=lower_options, default=["Volume", "RSI"])
+    show_volume = "Volume" in lower_selected
     show_rsi = "RSI" in lower_selected
     rsi_len  = st.number_input("RSI Length", value=14, min_value=2, max_value=200, step=1, disabled=not show_rsi)
     show_sto = "Stochastic %K/%D" in lower_selected
@@ -201,8 +202,8 @@ with st.sidebar:
     sto_d    = st.number_input("%D Length", value=3,  min_value=1, max_value=50,  step=1, disabled=not show_sto)
     sto_smooth = st.number_input("%K Smoothing", value=3, min_value=1, max_value=50, step=1, disabled=not show_sto)
 
-    st.markdown("### MACD")
-    show_macd = st.checkbox("MACD", value=False)
+    st.markdown("### MACD Settings")
+    show_macd = "MACD (panel)" in lower_selected
     macd_fast = st.number_input("MACD Fast EMA", value=12, min_value=2, max_value=100, step=1)
     macd_slow = st.number_input("MACD Slow EMA", value=26, min_value=2, max_value=100, step=1)
     macd_signal = st.number_input("MACD Signal EMA", value=9, min_value=1, max_value=50, step=1)
@@ -912,9 +913,12 @@ with tab1:
                 except Exception:
                     vwap_idx = None
 
-            # Count rows for subplots (MACD, RSI, Stoch)
-            rows = 2 + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
-            row_heights = [0.55, 0.13]
+            # Count rows for subplots (optional Volume, RSI, Stoch, MACD panel)
+            base_rows = 1 + (1 if show_volume else 0)
+            rows = base_rows + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
+            row_heights = [0.55]
+            if show_volume:
+                row_heights.append(0.13)
             if show_rsi:
                 row_heights.append(0.09)
             if show_sto:
@@ -1006,13 +1010,15 @@ with tab1:
                         e = ema(close, int(n))
                         fig.add_trace(go.Scatter(x=df.index, y=e, mode="lines", name=e.name), row=1, col=1)
 
-                    if "Volume" in df.columns and df["Volume"].notna().any():
-                        vol_colors = np.where(close >= df.get("Open", close), "rgba(0,200,0,0.6)", "rgba(200,0,0,0.6)")
-                        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=vol_colors, showlegend=False), row=2, col=1)
-                    else:
-                        fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="Volume", showlegend=False), row=2, col=1)
+                    # Optional Volume panel
+                    if show_volume:
+                        if "Volume" in df.columns and df["Volume"].notna().any():
+                            vol_colors = np.where(close >= df.get("Open", close), "rgba(0,200,0,0.6)", "rgba(200,0,0,0.6)")
+                            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=vol_colors, showlegend=False), row=2, col=1)
+                        else:
+                            fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="Volume", showlegend=False), row=2, col=1)
 
-                    next_row = 3
+                    next_row = 2 + (1 if show_volume else 0)
                     if show_rsi:
                         r = rsi(close, int(rsi_len))
                         fig.add_trace(go.Scatter(x=df.index, y=r, mode="lines", name=r.name), row=next_row, col=1)
