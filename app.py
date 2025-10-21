@@ -151,26 +151,7 @@ def style_axes(fig: go.Figure, dark: bool, rows: int):
 
 # ---------------- Sidebar (shared) ----------------
 with st.sidebar:
-    st.markdown("### Backtesting")
-    enable_backtest = st.checkbox("Enable Backtest", value=False)
-    strategy = None
-    if enable_backtest:
-        strategy = st.selectbox(
-            "Strategy",
-            [
-                "Price crosses above VWAP",
-                "Price crosses below VWAP",
-                "RSI crosses above 70",
-                "RSI crosses below 30",
-                "MACD crosses above Signal",
-                "MACD crosses below Signal"
-            ],
-            index=0
-        )
     st.header("Controls")
-    st.markdown("### Appearance")
-    theme = st.selectbox("Theme", ["System", "Dark", "Light"], index=0)
-template = apply_theme(theme)
 
 with st.sidebar:
     ticker = st.text_input("Ticker", value="AAPL").strip().upper()
@@ -211,12 +192,14 @@ with st.sidebar:
             ema_selected = [p for p in ma_periods if st.checkbox(f"EMA {p}", value=(p in [21, 50]), key=f"ema_{p}")]
 
     st.markdown("### Lower Panels")
-    show_rsi = st.checkbox("RSI", value=True)
-    rsi_len  = st.number_input("RSI Length", value=14, min_value=2, max_value=200, step=1)
-    show_sto = st.checkbox("Stochastic %K/%D", value=False)
-    sto_k    = st.number_input("%K Length", value=14, min_value=2, max_value=200, step=1)
-    sto_d    = st.number_input("%D Length", value=3,  min_value=1, max_value=50,  step=1)
-    sto_smooth = st.number_input("%K Smoothing", value=3, min_value=1, max_value=50, step=1)
+    lower_options = ["RSI", "Stochastic %K/%D"]
+    lower_selected = st.multiselect("Add panels", options=lower_options, default=["RSI"])
+    show_rsi = "RSI" in lower_selected
+    rsi_len  = st.number_input("RSI Length", value=14, min_value=2, max_value=200, step=1, disabled=not show_rsi)
+    show_sto = "Stochastic %K/%D" in lower_selected
+    sto_k    = st.number_input("%K Length", value=14, min_value=2, max_value=200, step=1, disabled=not show_sto)
+    sto_d    = st.number_input("%D Length", value=3,  min_value=1, max_value=50,  step=1, disabled=not show_sto)
+    sto_smooth = st.number_input("%K Smoothing", value=3, min_value=1, max_value=50, step=1, disabled=not show_sto)
 
     st.markdown("### MACD")
     show_macd = st.checkbox("MACD", value=False)
@@ -245,7 +228,6 @@ with st.sidebar:
 
     show_price_labels = st.checkbox("Show price labels (right)", value=False)
 
-    run_chart = st.button("Run Chart", use_container_width=True)
     force_fresh = st.checkbox("Force fresh fetch (bypass cache)", value=False)
     try:
         st.session_state['force_refresh'] = force_fresh
@@ -273,6 +255,29 @@ with st.sidebar:
         st.caption(f"Polygon key detected: {bool(_poly_key)} | Last source: {_last_src}")
     except Exception:
         pass
+
+# ---------------- Helpers (chart) ----------------
+with st.sidebar:
+    st.markdown("### Backtesting")
+    enable_backtest = st.checkbox("Enable Backtest", value=False)
+    strategy = None
+    if enable_backtest:
+        strategy = st.selectbox(
+            "Strategy",
+            [
+                "Price crosses above VWAP",
+                "Price crosses below VWAP",
+                "RSI crosses above 70",
+                "RSI crosses below 30",
+                "MACD crosses above Signal",
+                "MACD crosses below Signal"
+            ],
+            index=0
+        )
+
+    st.markdown("### Appearance")
+    theme = st.selectbox("Theme", ["System", "Dark", "Light"], index=0)
+template = apply_theme(theme)
 
 # ---------------- Helpers (chart) ----------------
 TARGETS = {"open", "high", "low", "close", "adj close", "adj_close", "adjclose", "volume"}
@@ -771,11 +776,8 @@ def extend_right_edge(fig: go.Figure, last_ts, interval: str, rows: int):
 
 # ---------------- CHART TAB ----------------
 with tab1:
-    if not run_chart:
-        st.info("Set parameters and click **Run Chart** to render.")
-    else:
-        # --- Simple Backtest Logic ---
-        def backtest_price_crosses_vwap(price: pd.Series, vwap: pd.Series):
+    # --- Simple Backtest Logic ---
+    def backtest_price_crosses_vwap(price: pd.Series, vwap: pd.Series):
             signals = (price > vwap) & (price.shift(1) <= vwap.shift(1))
             trades = []
             in_trade = False
@@ -796,7 +798,7 @@ with tab1:
                     entry_idx = None
             return trades
 
-        try:
+    try:
             # Map allowed intraday periods for Yahoo
             def best_period_for(interval_str: str, desired: str | None) -> str:
                 if interval_str == "1m":
@@ -1042,26 +1044,64 @@ with tab1:
                     # --- Run backtest if enabled and strategy is selected ---
                     trades = []
                     backtest_missing_anchor = False
-                    if enable_backtest and strategy == "Price crosses above VWAP":
-                        if vwap_idx is None:
-                            backtest_missing_anchor = True
-                        else:
-                            vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
-                            trades = backtest_price_crosses_vwap(close, vwap_series)
-                            # Plot buy/sell markers on chart
-                            for t in trades:
-                                fig.add_trace(go.Scatter(
-                                    x=[t['entry_time']], y=[t['entry_price']],
-                                    mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=14,
-                                    name="Buy"
-                                ), row=1, col=1)
-                                fig.add_trace(go.Scatter(
-                                    x=[t['exit_time']], y=[t['exit_price']],
-                                    mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=14,
-                                    name="Sell"
-                                ), row=1, col=1)
+                    if enable_backtest:
+                        def backtest_hold_condition(price_series: pd.Series, cond: pd.Series):
+                            cond = cond.fillna(False)
+                            entries = (cond & ~cond.shift(1).fillna(False))
+                            exits = (~cond & cond.shift(1).fillna(False))
+                            in_pos = False
+                            entry_idx = None
+                            out = []
+                            for i, ts in enumerate(price_series.index):
+                                if entries.iloc[i] and not in_pos:
+                                    in_pos = True
+                                    entry_idx = i
+                                elif exits.iloc[i] and in_pos:
+                                    out.append({
+                                        'entry_time': price_series.index[entry_idx],
+                                        'entry_price': float(price_series.iloc[entry_idx]),
+                                        'exit_time': ts,
+                                        'exit_price': float(price_series.iloc[i]),
+                                        'pnl': float(price_series.iloc[i] - price_series.iloc[entry_idx])
+                                    })
+                                    in_pos = False
+                                    entry_idx = None
+                            return out
 
-                    fig.update_layout(title=f"{ticker} — {interval}", xaxis_rangeslider_visible=False, height=base_height)
+                        if strategy == "Price crosses above VWAP":
+                            if vwap_idx is None:
+                                backtest_missing_anchor = True
+                            else:
+                                vwap_series = anchored_vwap(df, anchor_idx=vwap_idx)
+                                trades = backtest_price_crosses_vwap(close, vwap_series)
+                        elif strategy == "RSI crosses above 70":
+                            r = rsi(close, int(rsi_len))
+                            hold = r > 70
+                            trades = backtest_hold_condition(close, hold)
+                        elif strategy == "RSI crosses below 30":
+                            r = rsi(close, int(rsi_len))
+                            hold = r < 30
+                            trades = backtest_hold_condition(close, hold)
+                        elif strategy == "Bollinger Bands":
+                            lb, mb, ub = bbands(close, int(bb_len), float(bb_std))
+                            hold = (close > ub) | (close < lb)
+                            trades = backtest_hold_condition(close, hold)
+
+                        # Plot buy/sell markers on chart
+                        for t in trades:
+                            fig.add_trace(go.Scatter(
+                                x=[t['entry_time']], y=[t['entry_price']],
+                                mode="markers", marker_symbol="triangle-up", marker_color="#00ff00", marker_size=12,
+                                name="Buy"
+                            ), row=1, col=1)
+                            fig.add_trace(go.Scatter(
+                                x=[t['exit_time']], y=[t['exit_price']],
+                                mode="markers", marker_symbol="triangle-down", marker_color="#ff0000", marker_size=12,
+                                name="Sell"
+                            ), row=1, col=1)
+
+                    fig.update_layout(title=f"{ticker} - {interval}", xaxis_rangeslider_visible=False, height=base_height,
+                                      margin=dict(l=50, r=120, t=50, b=50))
                     style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
 
                     st.plotly_chart(fig, use_container_width=True)
@@ -1127,8 +1167,8 @@ with tab1:
                                 )
                             else:
                                 st.caption("No signals generated for the selected range and settings.")
-        except Exception as e:
-            st.error(f"Error fetching or plotting data: {e}")
+    except Exception as e:
+        st.error(f"Error fetching or plotting data: {e}")
 
 # ---------------- TRADINGVIEW TAB ----------------
 with tab3:
