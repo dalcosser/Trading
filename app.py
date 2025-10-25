@@ -793,6 +793,54 @@ def _normalize_host_path(p: str | None) -> str | None:
         return p
 
 @st.cache_data(show_spinner=False)
+def _autofind_report_excel_path(ticker: str) -> str | None:
+    """
+    Try to locate <TICKER>_technicals.xlsx without showing paths in the UI.
+    Order:
+      1) POLYGON_REPORTS_DIR env var
+      2) Common Windows path in user's Documents
+      3) WSL-style equivalent under /mnt/c
+      4) ./reports relative to CWD
+      5) Recursive search under user's Documents Polygon Data
+    Returns a normalized path or None.
+    """
+    import os, glob, getpass
+    t = ticker.strip().upper()
+    fname = f"{t}_technicals.xlsx"
+    # 1) Env var
+    env_dir = os.environ.get('POLYGON_REPORTS_DIR')
+    if env_dir:
+        p = _normalize_host_path(os.path.join(env_dir, fname))
+        if p and os.path.exists(p):
+            return p
+    # 2) Common Windows path
+    user = getpass.getuser()
+    win_dir = f"C:/Users/{user}/Documents/Polygon Data/reports"
+    p = _normalize_host_path(os.path.join(win_dir, fname))
+    if p and os.path.exists(p):
+        return p
+    # 3) WSL equivalent
+    wsl_dir = f"/mnt/c/Users/{user}/Documents/Polygon Data/reports"
+    p = _normalize_host_path(os.path.join(wsl_dir, fname))
+    if p and os.path.exists(p):
+        return p
+    # 4) ./reports relative to CWD
+    local_dir = os.path.join(os.getcwd(), 'reports')
+    p = _normalize_host_path(os.path.join(local_dir, fname))
+    if p and os.path.exists(p):
+        return p
+    # 5) Recursive search under user's Documents Polygon Data
+    base_dirs = [f"C:/Users/{user}/Documents/Polygon Data", f"/mnt/c/Users/{user}/Documents/Polygon Data"]
+    for bd in base_dirs:
+        root = _normalize_host_path(bd)
+        if root and os.path.exists(root):
+            pattern = os.path.join(root, '**', fname)
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                return _normalize_host_path(matches[0])
+    return None
+
+@st.cache_data(show_spinner=False)
 def _load_polygon_daily_for_ticker(
     data_root: str,
     ticker: str,
@@ -1151,7 +1199,7 @@ def _load_polygon_daily_for_ticker(
     out = out.sort_values('Date').reset_index(drop=True)
     return out
 
-def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float, direction: str) -> pd.DataFrame:
+def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float, direction: str | None = None) -> pd.DataFrame:
     """
     Compute event table for either:
       - mode='close_drop': prior close -> today close <= -threshold
@@ -1171,14 +1219,17 @@ def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float
 
     if mode == 'close_drop':
         drop_pct = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
-        mask = drop_pct <= -abs(threshold_pct)
-    elif mode == 'gap':
-        if direction == 'Up':
-            mask = df['Gap_%'] >= abs(threshold_pct)
-        elif direction == 'Down':
-            mask = df['Gap_%'] <= -abs(threshold_pct)
+        # Signed threshold: positive means up >= threshold; negative means down <= threshold
+        if threshold_pct >= 0:
+            mask = drop_pct >= threshold_pct
         else:
-            mask = (df['Gap_%'].abs() >= abs(threshold_pct))
+            mask = drop_pct <= threshold_pct
+    elif mode == 'gap':
+        # Signed threshold: positive means gap up >= threshold; negative means gap down <= threshold
+        if threshold_pct >= 0:
+            mask = df['Gap_%'] >= threshold_pct
+        else:
+            mask = df['Gap_%'] <= threshold_pct
     else:
         raise ValueError("mode must be 'close_drop' or 'gap'")
 
@@ -1538,21 +1589,20 @@ with tab1:
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
                         ], index=0)
-                        threshold = st.number_input("Threshold (%)", min_value=0.1, max_value=50.0, value=3.0, step=0.1)
-                        direction = "Down"
-                        if mode.startswith("Gap"):
-                            direction = st.selectbox("Direction", ["Down", "Up", "Both"], index=0)
-                            # explicit input field for gap threshold, if user wants a different one
-                            gap_threshold = st.number_input("Gap threshold (%)", min_value=0.1, max_value=50.0, value=float(threshold), step=0.1, key="gap_thr")
-                        else:
-                            gap_threshold = float(threshold)
+                        threshold = st.number_input(
+                            "Threshold (%) — use + for up, - for down",
+                            min_value=-50.0,
+                            max_value=50.0,
+                            value=-3.0,
+                            step=0.1,
+                        )
 
                         run = st.button("Run stats", key="run_gap_stats")
                         if run:
                             try:
-                                if uploaded_excel is None:
-                                    st.error("Please upload a report Excel to compute stats.")
-                                else:
+                                daily_hist = None
+                                # Prefer uploaded file; else silently auto-locate
+                                if uploaded_excel is not None:
                                     daily_hist = _load_polygon_daily_for_ticker(
                                         data_root="",
                                         ticker=stats_ticker,
@@ -1563,9 +1613,25 @@ with tab1:
                                         excel_path_override=None,
                                         allow_yahoo_fallback=False,
                                     )
-                                m = 'close_drop' if mode.startswith("Close") else 'gap'
-                                thr = float(gap_threshold if m == 'gap' else threshold)
-                                result_df = _compute_gap_drop_stats(daily_hist, m, thr, direction)
+                                else:
+                                    auto_path = _autofind_report_excel_path(stats_ticker)
+                                    if auto_path:
+                                        daily_hist = _load_polygon_daily_for_ticker(
+                                            data_root="",
+                                            ticker=stats_ticker,
+                                            reports_dir=None,
+                                            technicals_script=None,
+                                            auto_generate_report=False,
+                                            excel_override=None,
+                                            excel_path_override=auto_path,
+                                            allow_yahoo_fallback=False,
+                                        )
+                                if daily_hist is None or daily_hist.empty:
+                                    st.error("No historical data available. Upload a report Excel to compute stats.")
+                                    st.stop()
+                                    m = 'close_drop' if mode.startswith("Close") else 'gap'
+                                    thr = float(threshold)
+                                    result_df = _compute_gap_drop_stats(daily_hist, m, thr, None)
                                 st.caption(f"Matches: {len(result_df)} events")
                                 if not result_df.empty:
                                     # Summary KPIs
