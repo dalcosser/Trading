@@ -820,7 +820,11 @@ def _load_polygon_daily_for_ticker(
 
     if os.path.exists(path_xlsx):
             try:
-                xl = pd.ExcelFile(path_xlsx)
+                try:
+                    import openpyxl  # noqa: F401
+                    xl = pd.ExcelFile(path_xlsx, engine='openpyxl')
+                except ImportError as _e:
+                    raise RuntimeError("Excel engine 'openpyxl' is required to read .xlsx reports. Install with: pip install openpyxl")
                 def _try_sheet_to_ohlc(_df: pd.DataFrame) -> pd.DataFrame | None:
                     d = _df.copy()
                     # If index looks like dates and not a default RangeIndex, lift to a column
@@ -889,8 +893,9 @@ def _load_polygon_daily_for_ticker(
                         continue
                 if best is not None:
                     df = best
-            except Exception:
-                df = None
+            except Exception as e:
+                # Surface Excel parsing issues explicitly
+                raise RuntimeError(f"Failed reading Excel report {path_xlsx}: {e}")
 
     if df is None:
         # 2) Final fallback: build from daily_aggs_v1 flat files (CSV/CSV.GZ). This avoids Excel dependency.
