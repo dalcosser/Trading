@@ -1,0 +1,40 @@
+import streamlit as st
+import pandas as pd
+from datetime import date as _dt_date, timedelta as _dt_timedelta
+
+from src.ta_toolkit.data.downloader import get_ohlcv, get_options_chain
+from src.ta_toolkit.strategies.rsi_reversal import rsi_reversal
+from src.ta_toolkit.strategies.bbands_breakout import bbands_breakout
+from src.ta_toolkit.backtest.engine import vectorized_backtest
+
+try:
+    from src.ta_toolkit.charts.price_chart import plot_candles_with_signal as plot_func
+except ImportError:
+    from src.ta_toolkit.charts.price_chart import plot_chart as plot_func
+
+from src.ta_toolkit.indicators.ta import rsi
+from src.ta_toolkit.options.greeks import BSParams, greeks
+
+# ---------------------------------------------------------
+st.set_page_config(page_title="Codex TA Toolkit", layout="wide")
+st.markdown("# 📈 Technical Analysis, Backtesting & Options")
+
+# ---------------- Sidebar Controls -----------------------
+with st.sidebar:
+    st.header("Controls")
+    ticker = st.text_input("Ticker", value="AAPL").strip().upper()
+
+    # --- Interval & Period controls ---
+    st.markdown("### Timeframe")
+    interval = st.selectbox(
+        "Interval",
+        ["1d", "1h", "30m", "15m", "5m", "1m"],
+        index=0,
+    )
+
+    intraday = interval in {"1h", "30m", "15m", "5m", "1m"}
+    if intraday:
+        period = st.selectbox(
+            "Period (for intraday)",
+            ["1d", "5d", "7d", "14d", "30d", "60d", "90d"],
+            index=2 if interval == "1m" else 3,

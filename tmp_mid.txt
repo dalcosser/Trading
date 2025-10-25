@@ -1,0 +1,120 @@
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.date_input("Start (display only)", value=_dt_date.today() - _dt_timedelta(days=7))
+        with c2:
+            end = st.date_input("End (display only)", value=_dt_date.today())
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.date_input("Start", value=_dt_date.today() - _dt_timedelta(days=365 * 2))
+        with c2:
+            end = st.date_input("End", value=_dt_date.today())
+        period = None
+
+    strategy_name = st.selectbox("Strategy", ["RSI Reversal", "Bollinger Breakout"])
+    fee_bps = st.number_input("Fees (bps per turn)", value=2.0, step=1.0)
+
+    st.markdown("### Indicator Overlays")
+    show_bbands = st.checkbox("Bollinger Bands", value=True)
+    show_vwap = st.checkbox("VWAP", value=True)
+    show_macd = st.checkbox("MACD (overlay)", value=False)
+
+    with st.expander("Moving Averages", expanded=True):
+        st.caption("Check which SMA/EMA to overlay")
+        ma_periods = [10, 21, 50, 100, 150, 200]
+        cols = st.columns(2)
+        with cols[0]:
+            st.write("**SMA**")
+            sma_selected = [p for p in ma_periods if st.checkbox(f"SMA {p}", value=(p in [21, 50, 200]), key=f"sma_{p}")]
+        with cols[1]:
+            st.write("**EMA**")
+            ema_selected = [p for p in ma_periods if st.checkbox(f"EMA {p}", value=(p in [21, 50]), key=f"ema_{p}")]
+
+    run_btn = st.button("Run", use_container_width=True)  # ✅ Renamed
+
+# ---------------- Utility Functions -----------------------
+def _fmt(v, suffix=""):
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.2f}{suffix}"
+    except Exception:
+        return str(v)
+
+def _strategy(df: pd.DataFrame, name: str):
+    if name == "RSI Reversal":
+        return rsi_reversal(df)
+    elif name == "Bollinger Breakout":
+        return bbands_breakout(df)
+    else:
+        return pd.Series(0, index=df.index, name="signal")
+
+# ---------------- Tabs -----------------------
+tab1, tab2 = st.tabs(["📊 Backtest", "🧮 Options"])
+
+# ---------------- Tab 1: Backtest --------------------------
+with tab1:
+    if run_btn:
+        try:
+            # Fetch OHLCV data
+            df = get_ohlcv(
+                ticker,
+                start.isoformat() if not intraday else None,
+                end.isoformat() if not intraday else None,
+                interval=interval,
+                period=period,
+            )
+            st.caption(f"Data rows: {len(df)} | Columns: {list(df.columns)} | Interval: {interval}")
+
+            # Generate strategy signal
+            signal = _strategy(df, strategy_name)
+
+            # Run backtest
+            result = vectorized_backtest(df, signal, price_col="Close", fee_bps=float(fee_bps))
+
+            # Metrics
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("Total Return", _fmt(result.stats.get("Total_Return_%"), "%"))
+            m2.metric("CAGR", _fmt(result.stats.get("CAGR_%"), "%"))
+            m3.metric("Sharpe (ann.)", _fmt(result.stats.get("Sharpe")))
+            m4.metric("Max Drawdown", _fmt(result.stats.get("Max_Drawdown_%"), "%"))
+            m5.metric("Win Rate", _fmt(result.stats.get("Win_Rate_%"), "%"))
+            m6.metric("# Trades", f"{int(result.stats.get('Num_Trades', 0))}")
+
+            # Build overlays dictionary
+            overlays = {
+                "bbands": show_bbands,
+                "vwap": show_vwap,
+                "macd": show_macd,
+                "sma_periods": sma_selected,
+                "ema_periods": ema_selected,
+            }
+
+            # Plot chart
+            fig = plot_func(df, signal, ticker, overlays)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Equity Curve
+            st.subheader("Equity Curve")
+            eq = result.equity_curve.copy()
+            eq.name = "Equity Curve"
+            st.line_chart(eq)
+
+            # Trade Log
+            st.subheader("Trade Log")
+            if result.trades.empty:
+                st.info("No trades for the selected period.")
+            else:
+                st.dataframe(result.trades, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Backtest error: {e!s}")
+            st.exception(e)
+    else:
+        st.info("Set your parameters on the left, then click **Run**.")
+
+# ---------------- Tab 2: Options --------------------------
+with tab2:
+    st.markdown("### Nearest Options Chain (sample)")
+    try:
