@@ -777,6 +777,22 @@ def extend_right_edge(fig: go.Figure, last_ts, interval: str, rows: int):
 
 # ---------------- Historical Stats (Polygon flat files) ----------------
 @st.cache_data(show_spinner=False)
+def _normalize_host_path(p: str | None) -> str | None:
+    if p is None:
+        return None
+    try:
+        import os, re
+        s = str(p).strip().strip('"').strip("'")
+        # If running on non-Windows and given a Windows path, map to WSL style
+        if os.name != 'nt' and re.match(r'^[a-zA-Z]:[\\/]', s):
+            drive = s[0].lower()
+            rest = s[2:].replace('\\','/')
+            s = f"/mnt/{drive}/{rest.lstrip('/')}"
+        return os.path.normpath(s)
+    except Exception:
+        return p
+
+@st.cache_data(show_spinner=False)
 def _load_polygon_daily_for_ticker(
     data_root: str,
     ticker: str,
@@ -784,6 +800,7 @@ def _load_polygon_daily_for_ticker(
     technicals_script: str | None = None,
     auto_generate_report: bool = True,
     excel_override: object | None = None,
+    excel_path_override: str | None = None,
 ) -> pd.DataFrame:
     """
     Load per-ticker daily parquet from a Polygon flat-files export.
@@ -868,18 +885,21 @@ def _load_polygon_daily_for_ticker(
             raise RuntimeError(f"Failed reading uploaded Excel: {e}")
 
     # 1) Primary source: reports Excel (e.g., reports/AAPL_technicals.xlsx)
-    if reports_dir is None:
-        reports_dir = os.path.join(data_root, 'reports')
-    path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
+    data_root = _normalize_host_path(data_root) or data_root
+    reports_dir = _normalize_host_path(reports_dir or os.path.join(data_root, 'reports'))
+    # exact Excel override path (string path) wins if exists
+    if excel_path_override:
+        excel_path_override = _normalize_host_path(excel_path_override)
+    path_xlsx = excel_path_override or os.path.join(reports_dir or '', f"{t}_technicals.xlsx")
     # Normalize common user input issues (extra quotes/spaces, mixed separators)
-    path_xlsx = os.path.normpath(str(path_xlsx).strip().strip('"').strip("'"))
-    reports_dir = os.path.normpath(str(reports_dir).strip().strip('"').strip("'"))
+    path_xlsx = _normalize_host_path(path_xlsx) or path_xlsx
+    reports_dir = _normalize_host_path(reports_dir) or reports_dir
 
     # If not exactly in reports_dir, try to discover anywhere under data_root
     if not os.path.exists(path_xlsx):
         try:
             import glob as _glob
-            pattern = os.path.join(os.path.normpath(str(data_root).strip().strip('"').strip("'")), '**', f'{t}_technicals.xlsx')
+            pattern = os.path.join(_normalize_host_path(data_root) or data_root, '**', f'{t}_technicals.xlsx')
             candidates = sorted(_glob.glob(pattern, recursive=True))
             if candidates:
                 path_xlsx = candidates[0]
@@ -986,7 +1006,7 @@ def _load_polygon_daily_for_ticker(
 
     if df is None:
         # 2) Final fallback: build from daily_aggs_v1 flat files (CSV/CSV.GZ). This avoids Excel dependency.
-        daily_root = os.path.normpath(os.path.join(str(data_root).strip().strip('"').strip("'"), 'daily_aggs_v1'))
+        daily_root = _normalize_host_path(os.path.join(data_root, 'daily_aggs_v1')) or os.path.join(data_root, 'daily_aggs_v1')
         if not os.path.exists(daily_root):
             raise FileNotFoundError(f"No usable Excel report found at {path_xlsx} and no daily_aggs_v1 folder present.")
         try:
@@ -1480,19 +1500,39 @@ with tab1:
                         default_root = r"C:\\Users\\David Alcosser\\Documents\\Polygon Data"
                         data_root = st.text_input("Polygon Data folder", value=default_root)
                         reports_dir = st.text_input("Reports folder (Excel)", value=os.path.join(default_root, 'reports'))
-                        # Quick path diagnostics
-                        try:
-                            pr = os.path.normpath(os.path.join(reports_dir.strip().strip('"').strip("'"), f"{ticker.upper()}_technicals.xlsx"))
-                            dr = os.path.normpath(os.path.join(data_root.strip().strip('"').strip("'"), 'daily_aggs_v1'))
-                            st.caption(f"Expecting Excel: {pr} | Exists: {os.path.exists(pr)}")
-                            st.caption(f"daily_aggs_v1: {dr} | Exists: {os.path.exists(dr)}")
-                        except Exception:
-                            pass
+                        # (Diagnostics removed per request: no file paths shown in UI)
                         tech_script = st.text_input(
                             "Technicals script (optional auto-generate)",
                             value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
                         )
                         auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
+                        exact_excel_path = st.text_input("Or exact Excel path (optional)", value="")
+                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"])
+                        # Discover tickers from reports folder (and fallback to recursive under data_root)
+                        colscan1, colscan2 = st.columns(2)
+                        with colscan1:
+                            if st.button("Scan reports for tickers"):
+                                try:
+                                    import glob as _glob
+                                    # First, flat scan in reports_dir
+                                    pat = os.path.join(_normalize_host_path(reports_dir) or reports_dir, '*_technicals.xlsx')
+                                    files = sorted(_glob.glob(pat))
+                                    # If none, try recursive under data_root
+                                    if not files:
+                                        pat2 = os.path.join(_normalize_host_path(data_root) or data_root, '**', '*_technicals.xlsx')
+                                        files = sorted(_glob.glob(pat2, recursive=True))
+                                    tickers = [os.path.basename(x).split('_technicals',1)[0] for x in files]
+                                    st.session_state['reports_tickers'] = tickers
+                                    st.caption(f"Found {len(tickers)} tickers")
+                                    if files[:5]:
+                                        st.caption("Samples: " + ", ".join(os.path.basename(x) for x in files[:5]))
+                                except Exception as e:
+                                    st.error(f"Scan error: {e}")
+                        with colscan2:
+                            tickers = st.session_state.get('reports_tickers', [])
+                            chosen_report_ticker = st.selectbox("Pick ticker from reports", options=["(none)"] + tickers, index=0)
+                        # Decide stats ticker
+                        stats_ticker = ticker if chosen_report_ticker == "(none)" else chosen_report_ticker
                         # Optional: upload a report Excel directly
                         uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"])
                         # Discover tickers from reports folder
@@ -1536,6 +1576,7 @@ with tab1:
                                     technicals_script=tech_script,
                                     auto_generate_report=bool(auto_gen),
                                     excel_override=uploaded_excel,
+                                    excel_path_override=exact_excel_path if exact_excel_path.strip() else None,
                                 )
                                 # Optional: export a minimal Excel report to the reports folder
                                 cexp1, cexp2 = st.columns([1,3])
