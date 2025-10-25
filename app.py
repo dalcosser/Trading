@@ -820,7 +820,7 @@ def _load_polygon_daily_for_ticker(
                 ]
                 for cmd in tried_cmds:
                     try:
-                        subprocess.run(cmd, check=True, timeout=120)
+                        subprocess.run(cmd, check=True, timeout=180, capture_output=True)
                         break
                     except Exception:
                         continue
@@ -830,24 +830,70 @@ def _load_polygon_daily_for_ticker(
         if os.path.exists(path_xlsx):
             try:
                 xl = pd.ExcelFile(path_xlsx)
+                def _try_sheet_to_ohlc(_df: pd.DataFrame) -> pd.DataFrame | None:
+                    d = _df.copy()
+                    # If index looks like dates and not a default RangeIndex, lift to a column
+                    try:
+                        if not isinstance(d.index, pd.RangeIndex):
+                            idx_as_date = pd.to_datetime(d.index, errors='coerce')
+                            if idx_as_date.notna().mean() > 0.8 and 'Date' not in d.columns:
+                                d.insert(0, 'Date', idx_as_date)
+                                d.reset_index(drop=True, inplace=True)
+                    except Exception:
+                        pass
+                    # Normalize headers
+                    rename_map = {}
+                    for c in list(d.columns):
+                        lc = str(c).strip().lower().replace(' ', '').replace('_','')
+                        if lc in {'date','day','sessiondate','windowstart','t','timestamp'}:
+                            rename_map[c] = 'Date'
+                        elif lc in {'open','o'}:
+                            rename_map[c] = 'Open'
+                        elif lc in {'high','h'}:
+                            rename_map[c] = 'High'
+                        elif lc in {'low','l'}:
+                            rename_map[c] = 'Low'
+                        elif lc in {'close','c'}:
+                            rename_map[c] = 'Close'
+                        elif lc in {'adjclose','adjustedclose','adj_close'}:
+                            rename_map[c] = 'Adj Close'
+                        elif lc in {'volume','v','vol'}:
+                            rename_map[c] = 'Volume'
+                    if rename_map:
+                        d = d.rename(columns=rename_map)
+                    # If Date still missing, try first column
+                    if 'Date' not in d.columns and len(d.columns) > 0:
+                        try:
+                            cand = pd.to_datetime(d.iloc[:,0], errors='coerce')
+                            if cand.notna().mean() > 0.8:
+                                d.insert(0, 'Date', cand)
+                        except Exception:
+                            pass
+                    # If Close missing but Adj Close present
+                    if 'Close' not in d.columns and 'Adj Close' in d.columns:
+                        d['Close'] = pd.to_numeric(d['Adj Close'], errors='coerce')
+                    # Ensure numeric types where available
+                    for col in ['Open','High','Low','Close','Volume']:
+                        if col in d.columns:
+                            d[col] = pd.to_numeric(d[col], errors='coerce')
+                    # Final sanity: need Date + Close; for gap studies we also need Open
+                    if 'Date' in d.columns and 'Close' in d.columns:
+                        d['Date'] = pd.to_datetime(d['Date'], errors='coerce', utc=True)
+                        d = d.dropna(subset=['Date','Close'])
+                        d['Date'] = d['Date'].dt.tz_convert(None) if hasattr(d['Date'].dt, 'tz_convert') else d['Date']
+                        d = d.sort_values('Date').reset_index(drop=True)
+                        return d
+                    return None
+
                 best = None
-                best_score = -1
                 for sheet in xl.sheet_names:
                     try:
-                        df_s = xl.parse(sheet)
-                        cols_lower = {str(c).lower(): c for c in df_s.columns}
-                        need = 0
-                        for key in ['date','day','session_date','window_start','t','timestamp']:
-                            if key in cols_lower: need += 1; break
-                        for key in ['open']:
-                            if key in cols_lower: need += 1
-                        for key in ['close']:
-                            if key in cols_lower: need += 1
-                        # bonus for having high/low/volume
-                        bonus = sum(1 for k in ['high','low','volume','v'] if k in cols_lower)
-                        score = need*10 + bonus
-                        if score > best_score and len(df_s) >= 10:
-                            best, best_score = df_s, score
+                        cand = _try_sheet_to_ohlc(xl.parse(sheet))
+                        if cand is not None and len(cand) >= 10:
+                            best = cand
+                            # Prefer sheet names that sound like daily or price
+                            if str(sheet).lower() in {'daily','prices','ohlc','price','history'}:
+                                break
                     except Exception:
                         continue
                 if best is not None:
@@ -1297,6 +1343,7 @@ with tab1:
                             "Technicals script (optional auto-generate)",
                             value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
                         )
+                        auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
@@ -1318,7 +1365,7 @@ with tab1:
                                     ticker,
                                     reports_dir=reports_dir,
                                     technicals_script=tech_script,
-                                    auto_generate_report=True,
+                                    auto_generate_report=bool(auto_gen),
                                 )
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
                                 thr = float(gap_threshold if m == 'gap' else threshold)
