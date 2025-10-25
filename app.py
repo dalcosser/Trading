@@ -1530,43 +1530,10 @@ with tab1:
                     src = f" | Source: {provider}" if provider else ""
                     st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}{src}")
 
-                    # --- Historical Stats (from Polygon flat files) ---
-                    with st.expander("Historical Gap/Drop Stats (Polygon flat files)"):
-                        default_root = r"C:\\Users\\David Alcosser\\Documents\\Polygon Data"
-                        data_root = st.text_input("Polygon Data folder", value=default_root)
-                        reports_dir = st.text_input("Reports folder (Excel)", value=os.path.join(default_root, 'reports'))
-                        # (Diagnostics removed per request: no file paths shown in UI)
-                        tech_script = st.text_input(
-                            "Technicals script (optional auto-generate)",
-                            value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
-                        )
-                        auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
-                        # Yahoo fallback disabled per request (Excel/flat files only)
-                        exact_excel_path = st.text_input("Or exact Excel path (optional)", value="")
-                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"], key="reports_excel_upload")
-                        # Discover tickers from reports folder (and fallback to recursive under data_root)
-                        colscan1, colscan2 = st.columns(2)
-                        with colscan1:
-                            if st.button("Scan reports for tickers"):
-                                try:
-                                    import glob as _glob
-                                    # First, flat scan in reports_dir
-                                    pat = os.path.join(_normalize_host_path(reports_dir) or reports_dir, '*_technicals.xlsx')
-                                    files = sorted(_glob.glob(pat))
-                                    # If none, try recursive under data_root
-                                    if not files:
-                                        pat2 = os.path.join(_normalize_host_path(data_root) or data_root, '**', '*_technicals.xlsx')
-                                        files = sorted(_glob.glob(pat2, recursive=True))
-                                    tickers = [os.path.basename(x).split('_technicals',1)[0] for x in files]
-                                    st.session_state['reports_tickers'] = tickers
-                                    st.caption(f"Found {len(tickers)} tickers")
-                                except Exception as e:
-                                    st.error(f"Scan error: {e}")
-                        with colscan2:
-                            tickers = st.session_state.get('reports_tickers', [])
-                            chosen_report_ticker = st.selectbox("Pick ticker from reports", options=["(none)"] + tickers, index=0)
-                        # Decide stats ticker
-                        stats_ticker = ticker if chosen_report_ticker == "(none)" else chosen_report_ticker
+                    # --- Historical Stats (from uploaded Excel only) ---
+                    with st.expander("Historical Gap/Drop Stats"):
+                        uploaded_excel = st.file_uploader("Upload report Excel (*.xlsx)", type=["xlsx","xls"], key="reports_excel_upload")
+                        stats_ticker = ticker
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
@@ -1583,33 +1550,19 @@ with tab1:
                         run = st.button("Run stats", key="run_gap_stats")
                         if run:
                             try:
-                                daily_hist = _load_polygon_daily_for_ticker(
-                                    data_root,
-                                    stats_ticker,
-                                    reports_dir=reports_dir,
-                                    technicals_script=tech_script,
-                                    auto_generate_report=bool(auto_gen),
-                                    excel_override=uploaded_excel,
-                                    excel_path_override=exact_excel_path if exact_excel_path.strip() else None,
-                                    allow_yahoo_fallback=False,
-                                )
-                                # Optional: export a minimal Excel report to the reports folder
-                                cexp1, cexp2 = st.columns([1,3])
-                                with cexp1:
-                                    do_export = st.button("Write Excel report", key="write_excel_report")
-                                if do_export:
-                                    try:
-                                        import pandas as _pd
-                                        from pathlib import Path as _Path
-                                        out_dir = _Path(reports_dir)
-                                        out_dir.mkdir(parents=True, exist_ok=True)
-                                        out_path = out_dir / f"{ticker.upper()}_technicals.xlsx"
-                                        with _pd.ExcelWriter(out_path) as xw:
-                                            cols = [c for c in ['Date','Open','High','Low','Close','Volume'] if c in daily_hist.columns]
-                                            daily_hist[cols].to_excel(xw, index=False, sheet_name=f'{ticker.upper()}_Daily')
-                                        st.success(f"Wrote Excel: {out_path}")
-                                    except Exception as e:
-                                        st.error(f"Export error: {e}")
+                                if uploaded_excel is None:
+                                    st.error("Please upload a report Excel to compute stats.")
+                                else:
+                                    daily_hist = _load_polygon_daily_for_ticker(
+                                        data_root="",
+                                        ticker=stats_ticker,
+                                        reports_dir=None,
+                                        technicals_script=None,
+                                        auto_generate_report=False,
+                                        excel_override=uploaded_excel,
+                                        excel_path_override=None,
+                                        allow_yahoo_fallback=False,
+                                    )
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
                                 thr = float(gap_threshold if m == 'gap' else threshold)
                                 result_df = _compute_gap_drop_stats(daily_hist, m, thr, direction)
