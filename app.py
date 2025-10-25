@@ -794,20 +794,11 @@ def _load_polygon_daily_for_ticker(
     import pandas as pd
 
     t = ticker.strip().upper()
-    # 1) Prefer per_ticker_daily parquet for speed
-    path_parquet = os.path.join(data_root, 'per_ticker_daily', f'{t}.parquet')
     df = None
-    if os.path.exists(path_parquet):
-        try:
-            df = pd.read_parquet(path_parquet)
-        except Exception:
-            df = None
-
-    # 2) Fallback: reports Excel (e.g., reports/AAPL_technicals.xlsx)
-    if df is None:
-        if reports_dir is None:
-            reports_dir = os.path.join(data_root, 'reports')
-        path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
+    # 1) Primary source: reports Excel (e.g., reports/AAPL_technicals.xlsx)
+    if reports_dir is None:
+        reports_dir = os.path.join(data_root, 'reports')
+    path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
         if not os.path.exists(path_xlsx) and auto_generate_report and technicals_script:
             # Try to generate the report via external script
             try:
@@ -902,7 +893,65 @@ def _load_polygon_daily_for_ticker(
                 df = None
 
     if df is None:
-        raise FileNotFoundError(f"Missing file: {path_parquet} and no usable Excel report found.")
+        # 2) Final fallback: build from daily_aggs_v1 flat files (CSV/CSV.GZ). This avoids Excel dependency.
+        daily_root = os.path.join(data_root, 'daily_aggs_v1')
+        if not os.path.exists(daily_root):
+            raise FileNotFoundError(f"No usable Excel report found at {path_xlsx} and no daily_aggs_v1 folder present.")
+        try:
+            import glob
+            parts: list[pd.DataFrame] = []
+            pattern1 = os.path.join(daily_root, '**', '*.csv')
+            pattern2 = os.path.join(daily_root, '**', '*.csv.gz')
+            files = sorted(glob.glob(pattern1, recursive=True)) + sorted(glob.glob(pattern2, recursive=True))
+            usecols = None
+            for fp in files:
+                try:
+                    hdr = pd.read_csv(fp, nrows=0)
+                    lower = {str(c).lower(): c for c in hdr.columns}
+                    tcol = next((lower[k] for k in ('ticker','symbol','t') if k in lower), None)
+                    if not tcol:
+                        continue
+                    # Detect column names present in this file
+                    ocol = next((lower[k] for k in ('open','o') if k in lower), None)
+                    hcol = next((lower[k] for k in ('high','h') if k in lower), None)
+                    lcol = next((lower[k] for k in ('low','l') if k in lower), None)
+                    ccol = next((lower[k] for k in ('close','c') if k in lower), None)
+                    vcol = next((lower[k] for k in ('volume','v') if k in lower), None)
+                    dcol = next((lower[k] for k in ('date','day','window_start','timestamp','t') if k in lower), None)
+                    cols = [c for c in (tcol, dcol, ocol, hcol, lcol, ccol, vcol) if c]
+                    dfp = pd.read_csv(fp, usecols=cols)
+                    dfp = dfp[dfp[tcol].astype(str).str.upper() == t]
+                    if dfp.empty:
+                        continue
+                    # Normalize
+                    dfp = dfp.rename(columns={
+                        tcol: 'Ticker', dcol: 'Date', ocol or '': 'Open', hcol or '': 'High', lcol or '': 'Low', ccol or '': 'Close', vcol or '': 'Volume'
+                    })
+                    # Parse date robustly
+                    rawd = dfp['Date']
+                    if pd.api.types.is_numeric_dtype(rawd):
+                        mx = pd.to_numeric(rawd, errors='coerce').dropna().astype(float).max() if len(rawd) else 0
+                        if mx > 1e12:
+                            parsed = pd.to_datetime(rawd, unit='ns', errors='coerce', utc=True)
+                        elif mx > 1e9:
+                            parsed = pd.to_datetime(rawd, unit='s', errors='coerce', utc=True)
+                        else:
+                            parsed = pd.to_datetime(rawd, errors='coerce', utc=True)
+                    else:
+                        parsed = pd.to_datetime(rawd, errors='coerce', utc=True)
+                    dfp['Date'] = parsed.dt.tz_convert(None) if hasattr(parsed.dt, 'tz_convert') else parsed
+                    for col in ['Open','High','Low','Close','Volume']:
+                        if col in dfp.columns:
+                            dfp[col] = pd.to_numeric(dfp[col], errors='coerce')
+                    dfp = dfp.dropna(subset=['Date','Close'])
+                    parts.append(dfp[['Date','Open','High','Low','Close','Volume']])
+                except Exception:
+                    continue
+            if not parts:
+                raise FileNotFoundError(f"No usable Excel report at {path_xlsx} and could not assemble from daily_aggs_v1 CSVs for {t}.")
+            df = pd.concat(parts, ignore_index=True)
+        except Exception as e:
+            raise FileNotFoundError(f"Could not build daily series from flat files: {e}")
 
     # Normalize columns case-insensitively
     cols = {str(c).lower(): c for c in df.columns}
@@ -1367,6 +1416,23 @@ with tab1:
                                     technicals_script=tech_script,
                                     auto_generate_report=bool(auto_gen),
                                 )
+                                # Optional: export a minimal Excel report to the reports folder
+                                cexp1, cexp2 = st.columns([1,3])
+                                with cexp1:
+                                    do_export = st.button("Write Excel report", key="write_excel_report")
+                                if do_export:
+                                    try:
+                                        import pandas as _pd
+                                        from pathlib import Path as _Path
+                                        out_dir = _Path(reports_dir)
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        out_path = out_dir / f"{ticker.upper()}_technicals.xlsx"
+                                        with _pd.ExcelWriter(out_path) as xw:
+                                            cols = [c for c in ['Date','Open','High','Low','Close','Volume'] if c in daily_hist.columns]
+                                            daily_hist[cols].to_excel(xw, index=False, sheet_name=f'{ticker.upper()}_Daily')
+                                        st.success(f"Wrote Excel: {out_path}")
+                                    except Exception as e:
+                                        st.error(f"Export error: {e}")
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
                                 thr = float(gap_threshold if m == 'gap' else threshold)
                                 result_df = _compute_gap_drop_stats(daily_hist, m, thr, direction)
