@@ -775,6 +775,110 @@ def extend_right_edge(fig: go.Figure, last_ts, interval: str, rows: int):
         fig.add_trace(go.Scatter(x=[pad_x], y=[None], mode="markers",
                                  marker_opacity=0, showlegend=False, hoverinfo="skip"), row=r, col=1)
 
+# ---------------- Historical Stats (Polygon flat files) ----------------
+@st.cache_data(show_spinner=False)
+def _load_polygon_daily_for_ticker(data_root: str, ticker: str) -> pd.DataFrame:
+    """
+    Load per-ticker daily parquet from a Polygon flat-files export.
+    Expects a file like `<data_root>/per_ticker_daily/<TICKER>.parquet`.
+    Normalizes columns to ['Date','Open','High','Low','Close','Volume'] with Date as datetime.
+    Returns sorted ascending by Date.
+    """
+    import os
+    import pandas as pd
+
+    t = ticker.strip().upper()
+    path = os.path.join(data_root, 'per_ticker_daily', f'{t}.parquet')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {path}")
+    df = pd.read_parquet(path)
+
+    # Normalize columns case-insensitively
+    cols = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            key = n.lower()
+            if key in cols:
+                return cols[key]
+        return None
+
+    c_open = pick('open')
+    c_high = pick('high')
+    c_low = pick('low')
+    c_close = pick('close')
+    c_volume = pick('volume','v')
+    c_date = pick('date','day','session_date','window_start','t','timestamp')
+
+    if c_date is None or c_open is None or c_close is None:
+        raise ValueError(f"Unexpected schema in {path}. Columns: {list(df.columns)}")
+
+    # Parse date robustly (supports epoch ns/s or ISO strings)
+    _raw_date = df[c_date]
+    try:
+        import numpy as _np
+        import pandas as _pd
+        if _pd.api.types.is_numeric_dtype(_raw_date):
+            mx = _pd.to_numeric(_raw_date, errors='coerce').dropna().astype(float).max() if len(_raw_date) else 0
+            if mx > 1e12:
+                parsed_date = _pd.to_datetime(_raw_date, unit='ns', errors='coerce', utc=True)
+            elif mx > 1e9:
+                parsed_date = _pd.to_datetime(_raw_date, unit='s', errors='coerce', utc=True)
+            else:
+                parsed_date = _pd.to_datetime(_raw_date, errors='coerce', utc=True)
+        else:
+            parsed_date = _pd.to_datetime(_raw_date, errors='coerce', utc=True)
+    except Exception:
+        parsed_date = pd.to_datetime(_raw_date, errors='coerce', utc=True)
+
+    out = pd.DataFrame({
+        'Date': parsed_date,
+        'Open': pd.to_numeric(df[c_open], errors='coerce'),
+        'High': pd.to_numeric(df[c_high], errors='coerce') if c_high in df.columns else pd.NA,
+        'Low': pd.to_numeric(df[c_low], errors='coerce') if c_low in df.columns else pd.NA,
+        'Close': pd.to_numeric(df[c_close], errors='coerce'),
+        'Volume': pd.to_numeric(df[c_volume], errors='coerce') if c_volume in df.columns else pd.NA,
+    })
+    out = out.dropna(subset=['Date'])
+    # Convert to naive date (no timezone) for grouping/joins; keep time for safety
+    out['Date'] = out['Date'].dt.tz_convert(None) if hasattr(out['Date'].dt, 'tz_convert') else out['Date']
+    out = out.sort_values('Date').reset_index(drop=True)
+    return out
+
+def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float, direction: str) -> pd.DataFrame:
+    """
+    Compute event table for either:
+      - mode='close_drop': prior close -> today close <= -threshold
+      - mode='gap': gap % at open >= threshold (direction 'Up'/'Down')
+    Returns a DataFrame with Date, Gap_% , Intraday_% , Next_Overnight_% , Next_Intraday_% , Next_Total_% .
+    """
+    import numpy as np
+    df = daily.copy()
+    df['PrevClose'] = df['Close'].shift(1)
+    df['NextOpen'] = df['Open'].shift(-1)
+    df['NextClose'] = df['Close'].shift(-1)
+    df['Gap_%'] = (df['Open'] - df['PrevClose']) / df['PrevClose'] * 100.0
+    df['Intraday_%'] = (df['Close'] - df['Open']) / df['Open'] * 100.0
+    df['Next_Overnight_%'] = (df['NextOpen'] - df['Close']) / df['Close'] * 100.0
+    df['Next_Intraday_%'] = (df['NextClose'] - df['NextOpen']) / df['NextOpen'] * 100.0
+    df['Next_Total_%'] = (df['NextClose'] - df['Close']) / df['Close'] * 100.0
+
+    if mode == 'close_drop':
+        drop_% = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
+        mask = drop_% <= -abs(threshold_pct)
+    elif mode == 'gap':
+        if direction == 'Up':
+            mask = df['Gap_%'] >= abs(threshold_pct)
+        elif direction == 'Down':
+            mask = df['Gap_%'] <= -abs(threshold_pct)
+        else:
+            mask = (df['Gap_%'].abs() >= abs(threshold_pct))
+    else:
+        raise ValueError("mode must be 'close_drop' or 'gap'")
+
+    cols = ['Date','Gap_%','Intraday_%','Next_Overnight_%','Next_Intraday_%','Next_Total_%']
+    out = df.loc[mask, cols].dropna().reset_index(drop=True)
+    return out
+
 # ---------------- CHART TAB ----------------
 with tab1:
     # --- Simple Backtest Logic ---
@@ -1118,6 +1222,44 @@ with tab1:
                         pass
                     src = f" | Source: {provider}" if provider else ""
                     st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}{src}")
+
+                    # --- Historical Stats (from Polygon flat files) ---
+                    with st.expander("Historical Gap/Drop Stats (Polygon flat files)"):
+                        default_root = r"C:\\Users\\David Alcosser\\Documents\\Polygon Data"
+                        data_root = st.text_input("Polygon Data folder", value=default_root)
+                        mode = st.selectbox("Study", [
+                            "Close down N% day -> next day",
+                            "Gap up/down >= N% -> same day + next day",
+                        ], index=0)
+                        threshold = st.slider("Threshold (%)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
+                        direction = "Down"
+                        if mode.startswith("Gap"):
+                            direction = st.selectbox("Direction", ["Down", "Up", "Both"], index=0)
+
+                        run = st.button("Run stats", key="run_gap_stats")
+                        if run:
+                            try:
+                                daily_hist = _load_polygon_daily_for_ticker(data_root, ticker)
+                                m = 'close_drop' if mode.startswith("Close") else 'gap'
+                                result_df = _compute_gap_drop_stats(daily_hist, m, threshold, direction)
+                                st.caption(f"Matches: {len(result_df)} events")
+                                if not result_df.empty:
+                                    # Summary KPIs
+                                    c1,c2,c3,c4 = st.columns(4)
+                                    with c1:
+                                        st.metric("Avg Intraday %", f"{result_df['Intraday_%'].mean():.2f}%")
+                                    with c2:
+                                        st.metric("Avg Next Overnight %", f"{result_df['Next_Overnight_%'].mean():.2f}%")
+                                    with c3:
+                                        st.metric("Avg Next Intraday %", f"{result_df['Next_Intraday_%'].mean():.2f}%")
+                                    with c4:
+                                        st.metric("Avg Next Total %", f"{result_df['Next_Total_%'].mean():.2f}%")
+
+                                    st.dataframe(result_df, use_container_width=True)
+                                else:
+                                    st.info("No matching events for the selected criteria.")
+                            except Exception as e:
+                                st.error(f"Stats error: {e}")
 
                     # Optional: TradingView fallback expander (if the TV tab isn't visible in your setup)
                     with st.expander("TradingView (embedded)"):
