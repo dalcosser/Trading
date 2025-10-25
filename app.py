@@ -777,7 +777,13 @@ def extend_right_edge(fig: go.Figure, last_ts, interval: str, rows: int):
 
 # ---------------- Historical Stats (Polygon flat files) ----------------
 @st.cache_data(show_spinner=False)
-def _load_polygon_daily_for_ticker(data_root: str, ticker: str) -> pd.DataFrame:
+def _load_polygon_daily_for_ticker(
+    data_root: str,
+    ticker: str,
+    reports_dir: str | None = None,
+    technicals_script: str | None = None,
+    auto_generate_report: bool = True,
+) -> pd.DataFrame:
     """
     Load per-ticker daily parquet from a Polygon flat-files export.
     Expects a file like `<data_root>/per_ticker_daily/<TICKER>.parquet`.
@@ -788,10 +794,69 @@ def _load_polygon_daily_for_ticker(data_root: str, ticker: str) -> pd.DataFrame:
     import pandas as pd
 
     t = ticker.strip().upper()
-    path = os.path.join(data_root, 'per_ticker_daily', f'{t}.parquet')
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing file: {path}")
-    df = pd.read_parquet(path)
+    # 1) Prefer per_ticker_daily parquet for speed
+    path_parquet = os.path.join(data_root, 'per_ticker_daily', f'{t}.parquet')
+    df = None
+    if os.path.exists(path_parquet):
+        try:
+            df = pd.read_parquet(path_parquet)
+        except Exception:
+            df = None
+
+    # 2) Fallback: reports Excel (e.g., reports/AAPL_technicals.xlsx)
+    if df is None:
+        if reports_dir is None:
+            reports_dir = os.path.join(data_root, 'reports')
+        path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
+        if not os.path.exists(path_xlsx) and auto_generate_report and technicals_script:
+            # Try to generate the report via external script
+            try:
+                import sys, subprocess
+                # Attempt common CLIs
+                tried_cmds = [
+                    [sys.executable, technicals_script, t, reports_dir],
+                    [sys.executable, technicals_script, '--ticker', t, '--out', reports_dir],
+                    [sys.executable, technicals_script, '--ticker', t],
+                ]
+                for cmd in tried_cmds:
+                    try:
+                        subprocess.run(cmd, check=True, timeout=120)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass  # Non-fatal; will try reading if the script happened to succeed
+
+        if os.path.exists(path_xlsx):
+            try:
+                xl = pd.ExcelFile(path_xlsx)
+                best = None
+                best_score = -1
+                for sheet in xl.sheet_names:
+                    try:
+                        df_s = xl.parse(sheet)
+                        cols_lower = {str(c).lower(): c for c in df_s.columns}
+                        need = 0
+                        for key in ['date','day','session_date','window_start','t','timestamp']:
+                            if key in cols_lower: need += 1; break
+                        for key in ['open']:
+                            if key in cols_lower: need += 1
+                        for key in ['close']:
+                            if key in cols_lower: need += 1
+                        # bonus for having high/low/volume
+                        bonus = sum(1 for k in ['high','low','volume','v'] if k in cols_lower)
+                        score = need*10 + bonus
+                        if score > best_score and len(df_s) >= 10:
+                            best, best_score = df_s, score
+                    except Exception:
+                        continue
+                if best is not None:
+                    df = best
+            except Exception:
+                df = None
+
+    if df is None:
+        raise FileNotFoundError(f"Missing file: {path_parquet} and no usable Excel report found.")
 
     # Normalize columns case-insensitively
     cols = {str(c).lower(): c for c in df.columns}
@@ -1227,21 +1292,37 @@ with tab1:
                     with st.expander("Historical Gap/Drop Stats (Polygon flat files)"):
                         default_root = r"C:\\Users\\David Alcosser\\Documents\\Polygon Data"
                         data_root = st.text_input("Polygon Data folder", value=default_root)
+                        reports_dir = st.text_input("Reports folder (Excel)", value=os.path.join(default_root, 'reports'))
+                        tech_script = st.text_input(
+                            "Technicals script (optional auto-generate)",
+                            value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
+                        )
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
                         ], index=0)
-                        threshold = st.slider("Threshold (%)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
+                        threshold = st.number_input("Threshold (%)", min_value=0.1, max_value=50.0, value=3.0, step=0.1)
                         direction = "Down"
                         if mode.startswith("Gap"):
                             direction = st.selectbox("Direction", ["Down", "Up", "Both"], index=0)
+                            # explicit input field for gap threshold, if user wants a different one
+                            gap_threshold = st.number_input("Gap threshold (%)", min_value=0.1, max_value=50.0, value=float(threshold), step=0.1, key="gap_thr")
+                        else:
+                            gap_threshold = float(threshold)
 
                         run = st.button("Run stats", key="run_gap_stats")
                         if run:
                             try:
-                                daily_hist = _load_polygon_daily_for_ticker(data_root, ticker)
+                                daily_hist = _load_polygon_daily_for_ticker(
+                                    data_root,
+                                    ticker,
+                                    reports_dir=reports_dir,
+                                    technicals_script=tech_script,
+                                    auto_generate_report=True,
+                                )
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
-                                result_df = _compute_gap_drop_stats(daily_hist, m, threshold, direction)
+                                thr = float(gap_threshold if m == 'gap' else threshold)
+                                result_df = _compute_gap_drop_stats(daily_hist, m, thr, direction)
                                 st.caption(f"Matches: {len(result_df)} events")
                                 if not result_df.empty:
                                     # Summary KPIs
