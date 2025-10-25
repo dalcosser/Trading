@@ -801,6 +801,7 @@ def _load_polygon_daily_for_ticker(
     auto_generate_report: bool = True,
     excel_override: object | None = None,
     excel_path_override: str | None = None,
+    allow_yahoo_fallback: bool = False,
 ) -> pd.DataFrame:
     """
     Load per-ticker daily parquet from a Polygon flat-files export.
@@ -1001,20 +1002,22 @@ def _load_polygon_daily_for_ticker(
                 if best is not None:
                     df = best
             except Exception as e:
-                # Surface Excel parsing issues explicitly
-                raise RuntimeError(f"Failed reading Excel report {path_xlsx}: {e}")
+                # Surface Excel parsing issues without exposing paths
+                raise RuntimeError(f"Failed reading Excel report: {e}")
 
     if df is None:
         # 2) Final fallback: build from daily_aggs_v1 flat files (CSV/CSV.GZ). This avoids Excel dependency.
         daily_root = _normalize_host_path(os.path.join(data_root, 'daily_aggs_v1')) or os.path.join(data_root, 'daily_aggs_v1')
         if not os.path.exists(daily_root):
-            raise FileNotFoundError(f"No usable Excel report found at {path_xlsx} and no daily_aggs_v1 folder present.")
+            daily_root = None
         try:
             import glob
             parts: list[pd.DataFrame] = []
-            pattern1 = os.path.join(daily_root, '**', '*.csv')
-            pattern2 = os.path.join(daily_root, '**', '*.csv.gz')
-            files = sorted(glob.glob(pattern1, recursive=True)) + sorted(glob.glob(pattern2, recursive=True))
+            files: list[str] = []
+            if daily_root:
+                pattern1 = os.path.join(daily_root, '**', '*.csv')
+                pattern2 = os.path.join(daily_root, '**', '*.csv.gz')
+                files = sorted(glob.glob(pattern1, recursive=True)) + sorted(glob.glob(pattern2, recursive=True))
             usecols = None
             for fp in files:
                 try:
@@ -1059,11 +1062,43 @@ def _load_polygon_daily_for_ticker(
                     parts.append(dfp[['Date','Open','High','Low','Close','Volume']])
                 except Exception:
                     continue
-            if not parts:
-                raise FileNotFoundError(f"No usable Excel report at {path_xlsx} and could not assemble from daily_aggs_v1 CSVs for {t}.")
-            df = pd.concat(parts, ignore_index=True)
+            if parts:
+                df = pd.concat(parts, ignore_index=True)
         except Exception as e:
-            raise FileNotFoundError(f"Could not build daily series from flat files: {e}")
+            df = None
+
+    # 3) Final safety: Yahoo Finance fallback (optional)
+    if df is None and allow_yahoo_fallback:
+        try:
+            import yfinance as _yf
+            ydf = _yf.download(
+                tickers=str(t),
+                period="max",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by=None,
+            )
+            if ydf is not None and not ydf.empty:
+                if isinstance(ydf.index, pd.DatetimeIndex):
+                    out = pd.DataFrame({
+                        'Date': pd.to_datetime(ydf.index, utc=True),
+                        'Open': pd.to_numeric(ydf.get('Open'), errors='coerce'),
+                        'High': pd.to_numeric(ydf.get('High'), errors='coerce'),
+                        'Low': pd.to_numeric(ydf.get('Low'), errors='coerce'),
+                        'Close': pd.to_numeric(ydf.get('Close') if 'Close' in ydf.columns else ydf.get('Adj Close'), errors='coerce'),
+                        'Volume': pd.to_numeric(ydf.get('Volume'), errors='coerce'),
+                    })
+                    out = out.dropna(subset=['Date','Close'])
+                    out['Date'] = out['Date'].dt.tz_convert(None)
+                    out = out.sort_values('Date').reset_index(drop=True)
+                    df = out
+        except Exception:
+            df = None
+
+    # If still nothing, raise a generic error (no paths)
+    if df is None:
+        raise ValueError("No historical data found via Excel, flat files, or Yahoo fallback.")
 
     # Normalize columns case-insensitively
     cols = {str(c).lower(): c for c in df.columns}
@@ -1506,6 +1541,7 @@ with tab1:
                             value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
                         )
                         auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
+                        # Yahoo fallback disabled per request (Excel/flat files only)
                         exact_excel_path = st.text_input("Or exact Excel path (optional)", value="")
                         uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"], key="reports_excel_upload")
                         # Discover tickers from reports folder (and fallback to recursive under data_root)
@@ -1524,8 +1560,6 @@ with tab1:
                                     tickers = [os.path.basename(x).split('_technicals',1)[0] for x in files]
                                     st.session_state['reports_tickers'] = tickers
                                     st.caption(f"Found {len(tickers)} tickers")
-                                    if files[:5]:
-                                        st.caption("Samples: " + ", ".join(os.path.basename(x) for x in files[:5]))
                                 except Exception as e:
                                     st.error(f"Scan error: {e}")
                         with colscan2:
@@ -1557,6 +1591,7 @@ with tab1:
                                     auto_generate_report=bool(auto_gen),
                                     excel_override=uploaded_excel,
                                     excel_path_override=exact_excel_path if exact_excel_path.strip() else None,
+                                    allow_yahoo_fallback=False,
                                 )
                                 # Optional: export a minimal Excel report to the reports folder
                                 cexp1, cexp2 = st.columns([1,3])
