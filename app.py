@@ -1213,9 +1213,12 @@ def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float
     df['NextClose'] = df['Close'].shift(-1)
     df['Gap_%'] = (df['Open'] - df['PrevClose']) / df['PrevClose'] * 100.0
     df['Intraday_%'] = (df['Close'] - df['Open']) / df['Open'] * 100.0
+    # Event-day close-to-close move
+    df['Close_to_Close_%'] = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
     df['Next_Overnight_%'] = (df['NextOpen'] - df['Close']) / df['Close'] * 100.0
     df['Next_Intraday_%'] = (df['NextClose'] - df['NextOpen']) / df['NextOpen'] * 100.0
     df['Next_Total_%'] = (df['NextClose'] - df['Close']) / df['Close'] * 100.0
+    df['Next_Close_to_Close_%'] = df['Next_Total_%']
 
     if mode == 'close_drop':
         drop_pct = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
@@ -1233,7 +1236,10 @@ def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float
     else:
         raise ValueError("mode must be 'close_drop' or 'gap'")
 
-    cols = ['Date','Gap_%','Intraday_%','Next_Overnight_%','Next_Intraday_%','Next_Total_%']
+    if mode == 'close_drop':
+        cols = ['Date','Close_to_Close_%','Next_Overnight_%','Next_Intraday_%','Next_Close_to_Close_%']
+    else:
+        cols = ['Date','Gap_%','Intraday_%','Next_Overnight_%','Next_Intraday_%','Next_Total_%']
     out = df.loc[mask, cols].dropna().reset_index(drop=True)
     return out
 
@@ -1636,14 +1642,24 @@ with tab1:
                                 if not result_df.empty:
                                     # Summary KPIs
                                     c1,c2,c3,c4 = st.columns(4)
-                                    with c1:
-                                        st.metric("Avg Intraday %", f"{result_df['Intraday_%'].mean():.2f}%")
-                                    with c2:
-                                        st.metric("Avg Next Overnight %", f"{result_df['Next_Overnight_%'].mean():.2f}%")
-                                    with c3:
-                                        st.metric("Avg Next Intraday %", f"{result_df['Next_Intraday_%'].mean():.2f}%")
-                                    with c4:
-                                        st.metric("Avg Next Total %", f"{result_df['Next_Total_%'].mean():.2f}%")
+                                    if m == 'close_drop':
+                                        with c1:
+                                            st.metric("Avg Close→Close %", f"{result_df['Close_to_Close_%'].mean():.2f}%")
+                                        with c2:
+                                            st.metric("Avg Next Overnight %", f"{result_df['Next_Overnight_%'].mean():.2f}%")
+                                        with c3:
+                                            st.metric("Avg Next Intraday %", f"{result_df['Next_Intraday_%'].mean():.2f}%")
+                                        with c4:
+                                            st.metric("Avg Next Close→Close %", f"{result_df['Next_Close_to_Close_%'].mean():.2f}%")
+                                    else:
+                                        with c1:
+                                            st.metric("Avg Intraday %", f"{result_df['Intraday_%'].mean():.2f}%")
+                                        with c2:
+                                            st.metric("Avg Next Overnight %", f"{result_df['Next_Overnight_%'].mean():.2f}%")
+                                        with c3:
+                                            st.metric("Avg Next Intraday %", f"{result_df['Next_Intraday_%'].mean():.2f}%")
+                                        with c4:
+                                            st.metric("Avg Next Total %", f"{result_df['Next_Total_%'].mean():.2f}%")
 
                                     st.dataframe(result_df, use_container_width=True)
                                 else:
