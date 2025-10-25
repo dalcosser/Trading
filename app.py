@@ -783,6 +783,7 @@ def _load_polygon_daily_for_ticker(
     reports_dir: str | None = None,
     technicals_script: str | None = None,
     auto_generate_report: bool = True,
+    excel_override: object | None = None,
 ) -> pd.DataFrame:
     """
     Load per-ticker daily parquet from a Polygon flat-files export.
@@ -795,10 +796,96 @@ def _load_polygon_daily_for_ticker(
 
     t = ticker.strip().upper()
     df = None
+    # 0) If a file-like Excel was provided (uploaded), parse it first
+    if excel_override is not None:
+        try:
+            try:
+                import openpyxl  # noqa: F401
+                xl = pd.ExcelFile(excel_override, engine='openpyxl')
+            except ImportError:
+                xl = pd.ExcelFile(excel_override)
+            def _try_sheet_to_ohlc(_df: pd.DataFrame) -> pd.DataFrame | None:
+                d = _df.copy()
+                try:
+                    if not isinstance(d.index, pd.RangeIndex):
+                        idx_as_date = pd.to_datetime(d.index, errors='coerce')
+                        if idx_as_date.notna().mean() > 0.8 and 'Date' not in d.columns:
+                            d.insert(0, 'Date', idx_as_date)
+                            d.reset_index(drop=True, inplace=True)
+                except Exception:
+                    pass
+                rename_map = {}
+                for c in list(d.columns):
+                    lc = str(c).strip().lower().replace(' ', '').replace('_','')
+                    if lc in {'date','day','sessiondate','windowstart','t','timestamp'}:
+                        rename_map[c] = 'Date'
+                    elif lc in {'open','o'}:
+                        rename_map[c] = 'Open'
+                    elif lc in {'high','h'}:
+                        rename_map[c] = 'High'
+                    elif lc in {'low','l'}:
+                        rename_map[c] = 'Low'
+                    elif lc in {'close','c'}:
+                        rename_map[c] = 'Close'
+                    elif lc in {'adjclose','adjustedclose','adj_close'}:
+                        rename_map[c] = 'Adj Close'
+                    elif lc in {'volume','v','vol'}:
+                        rename_map[c] = 'Volume'
+                if rename_map:
+                    d = d.rename(columns=rename_map)
+                if 'Date' not in d.columns and len(d.columns) > 0:
+                    try:
+                        cand = pd.to_datetime(d.iloc[:,0], errors='coerce')
+                        if cand.notna().mean() > 0.8:
+                            d.insert(0, 'Date', cand)
+                    except Exception:
+                        pass
+                if 'Close' not in d.columns and 'Adj Close' in d.columns:
+                    d['Close'] = pd.to_numeric(d['Adj Close'], errors='coerce')
+                for col in ['Open','High','Low','Close','Volume']:
+                    if col in d.columns:
+                        d[col] = pd.to_numeric(d[col], errors='coerce')
+                if 'Date' in d.columns and 'Close' in d.columns:
+                    d['Date'] = pd.to_datetime(d['Date'], errors='coerce', utc=True)
+                    d = d.dropna(subset=['Date','Close'])
+                    d['Date'] = d['Date'].dt.tz_convert(None) if hasattr(d['Date'].dt, 'tz_convert') else d['Date']
+                    d = d.sort_values('Date').reset_index(drop=True)
+                    return d
+                return None
+            best = None
+            for sheet in xl.sheet_names:
+                try:
+                    cand = _try_sheet_to_ohlc(xl.parse(sheet))
+                    if cand is not None and len(cand) >= 5:
+                        best = cand
+                        if str(sheet).lower() in {'daily','prices','ohlc','price','history'}:
+                            break
+                except Exception:
+                    continue
+            if best is not None:
+                return best
+        except Exception as e:
+            raise RuntimeError(f"Failed reading uploaded Excel: {e}")
+
     # 1) Primary source: reports Excel (e.g., reports/AAPL_technicals.xlsx)
     if reports_dir is None:
         reports_dir = os.path.join(data_root, 'reports')
     path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
+    # Normalize common user input issues (extra quotes/spaces, mixed separators)
+    path_xlsx = os.path.normpath(str(path_xlsx).strip().strip('"').strip("'"))
+    reports_dir = os.path.normpath(str(reports_dir).strip().strip('"').strip("'"))
+
+    # If not exactly in reports_dir, try to discover anywhere under data_root
+    if not os.path.exists(path_xlsx):
+        try:
+            import glob as _glob
+            pattern = os.path.join(os.path.normpath(str(data_root).strip().strip('"').strip("'")), '**', f'{t}_technicals.xlsx')
+            candidates = sorted(_glob.glob(pattern, recursive=True))
+            if candidates:
+                path_xlsx = candidates[0]
+        except Exception:
+            pass
+
     if not os.path.exists(path_xlsx) and auto_generate_report and technicals_script:
             # Try to generate the report via external script
             try:
@@ -899,7 +986,7 @@ def _load_polygon_daily_for_ticker(
 
     if df is None:
         # 2) Final fallback: build from daily_aggs_v1 flat files (CSV/CSV.GZ). This avoids Excel dependency.
-        daily_root = os.path.join(data_root, 'daily_aggs_v1')
+        daily_root = os.path.normpath(os.path.join(str(data_root).strip().strip('"').strip("'"), 'daily_aggs_v1'))
         if not os.path.exists(daily_root):
             raise FileNotFoundError(f"No usable Excel report found at {path_xlsx} and no daily_aggs_v1 folder present.")
         try:
@@ -1393,11 +1480,39 @@ with tab1:
                         default_root = r"C:\\Users\\David Alcosser\\Documents\\Polygon Data"
                         data_root = st.text_input("Polygon Data folder", value=default_root)
                         reports_dir = st.text_input("Reports folder (Excel)", value=os.path.join(default_root, 'reports'))
+                        # Quick path diagnostics
+                        try:
+                            pr = os.path.normpath(os.path.join(reports_dir.strip().strip('"').strip("'"), f"{ticker.upper()}_technicals.xlsx"))
+                            dr = os.path.normpath(os.path.join(data_root.strip().strip('"').strip("'"), 'daily_aggs_v1'))
+                            st.caption(f"Expecting Excel: {pr} | Exists: {os.path.exists(pr)}")
+                            st.caption(f"daily_aggs_v1: {dr} | Exists: {os.path.exists(dr)}")
+                        except Exception:
+                            pass
                         tech_script = st.text_input(
                             "Technicals script (optional auto-generate)",
                             value=r"C:\\Users\\David Alcosser\\Documents\\Flat File Polygon\\print_ticker_technicals.py",
                         )
                         auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
+                        # Optional: upload a report Excel directly
+                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"])
+                        # Discover tickers from reports folder
+                        colscan1, colscan2 = st.columns(2)
+                        with colscan1:
+                            if st.button("Scan reports for tickers"):
+                                try:
+                                    import glob as _glob
+                                    pat = os.path.join(reports_dir.strip().strip('"').strip("'"), '*_technicals.xlsx')
+                                    files = sorted(_glob.glob(pat))
+                                    tickers = [os.path.basename(x).split('_technicals',1)[0] for x in files]
+                                    st.session_state['reports_tickers'] = tickers
+                                    st.success(f"Found {len(tickers)} tickers in reports folder")
+                                except Exception as e:
+                                    st.error(f"Scan error: {e}")
+                        with colscan2:
+                            tickers = st.session_state.get('reports_tickers', [])
+                            chosen_report_ticker = st.selectbox("Pick ticker from reports", options=["(none)"] + tickers, index=0)
+                        # Choose which ticker to use for stats
+                        stats_ticker = ticker if chosen_report_ticker == "(none)" else chosen_report_ticker
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
@@ -1416,10 +1531,11 @@ with tab1:
                             try:
                                 daily_hist = _load_polygon_daily_for_ticker(
                                     data_root,
-                                    ticker,
+                                    stats_ticker,
                                     reports_dir=reports_dir,
                                     technicals_script=tech_script,
                                     auto_generate_report=bool(auto_gen),
+                                    excel_override=uploaded_excel,
                                 )
                                 # Optional: export a minimal Excel report to the reports folder
                                 cexp1, cexp2 = st.columns([1,3])
