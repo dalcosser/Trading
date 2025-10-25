@@ -863,8 +863,8 @@ def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float
     df['Next_Total_%'] = (df['NextClose'] - df['Close']) / df['Close'] * 100.0
 
     if mode == 'close_drop':
-        drop_% = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
-        mask = drop_% <= -abs(threshold_pct)
+        drop_pct = (df['Close'] - df['PrevClose']) / df['PrevClose'] * 100.0
+        mask = drop_pct <= -abs(threshold_pct)
     elif mode == 'gap':
         if direction == 'Up':
             mask = df['Gap_%'] >= abs(threshold_pct)
