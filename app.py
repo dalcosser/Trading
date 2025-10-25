@@ -799,7 +799,7 @@ def _load_polygon_daily_for_ticker(
     if reports_dir is None:
         reports_dir = os.path.join(data_root, 'reports')
     path_xlsx = os.path.join(reports_dir, f"{t}_technicals.xlsx")
-        if not os.path.exists(path_xlsx) and auto_generate_report and technicals_script:
+    if not os.path.exists(path_xlsx) and auto_generate_report and technicals_script:
             # Try to generate the report via external script
             try:
                 import sys, subprocess
@@ -818,7 +818,7 @@ def _load_polygon_daily_for_ticker(
             except Exception:
                 pass  # Non-fatal; will try reading if the script happened to succeed
 
-        if os.path.exists(path_xlsx):
+    if os.path.exists(path_xlsx):
             try:
                 xl = pd.ExcelFile(path_xlsx)
                 def _try_sheet_to_ohlc(_df: pd.DataFrame) -> pd.DataFrame | None:
@@ -970,7 +970,7 @@ def _load_polygon_daily_for_ticker(
     c_date = pick('date','day','session_date','window_start','t','timestamp')
 
     if c_date is None or c_open is None or c_close is None:
-        raise ValueError(f"Unexpected schema in {path}. Columns: {list(df.columns)}")
+        raise ValueError(f"Unexpected schema for {t}. Columns: {list(df.columns)}")
 
     # Parse date robustly (supports epoch ns/s or ISO strings)
     _raw_date = df[c_date]
