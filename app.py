@@ -1507,7 +1507,7 @@ with tab1:
                         )
                         auto_gen = st.checkbox("Auto-generate missing Excel via script", value=True)
                         exact_excel_path = st.text_input("Or exact Excel path (optional)", value="")
-                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"])
+                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"], key="reports_excel_upload")
                         # Discover tickers from reports folder (and fallback to recursive under data_root)
                         colscan1, colscan2 = st.columns(2)
                         with colscan1:
@@ -1532,26 +1532,6 @@ with tab1:
                             tickers = st.session_state.get('reports_tickers', [])
                             chosen_report_ticker = st.selectbox("Pick ticker from reports", options=["(none)"] + tickers, index=0)
                         # Decide stats ticker
-                        stats_ticker = ticker if chosen_report_ticker == "(none)" else chosen_report_ticker
-                        # Optional: upload a report Excel directly
-                        uploaded_excel = st.file_uploader("Or upload a report Excel", type=["xlsx","xls"])
-                        # Discover tickers from reports folder
-                        colscan1, colscan2 = st.columns(2)
-                        with colscan1:
-                            if st.button("Scan reports for tickers"):
-                                try:
-                                    import glob as _glob
-                                    pat = os.path.join(reports_dir.strip().strip('"').strip("'"), '*_technicals.xlsx')
-                                    files = sorted(_glob.glob(pat))
-                                    tickers = [os.path.basename(x).split('_technicals',1)[0] for x in files]
-                                    st.session_state['reports_tickers'] = tickers
-                                    st.success(f"Found {len(tickers)} tickers in reports folder")
-                                except Exception as e:
-                                    st.error(f"Scan error: {e}")
-                        with colscan2:
-                            tickers = st.session_state.get('reports_tickers', [])
-                            chosen_report_ticker = st.selectbox("Pick ticker from reports", options=["(none)"] + tickers, index=0)
-                        # Choose which ticker to use for stats
                         stats_ticker = ticker if chosen_report_ticker == "(none)" else chosen_report_ticker
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
