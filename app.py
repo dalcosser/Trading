@@ -161,12 +161,25 @@ with st.sidebar:
     except Exception:
         default_parquet_dir = ""
     parquet_dir_input = st.text_input("Per-ticker Parquet directory", value=default_parquet_dir)
-    if parquet_dir_input and parquet_dir_input != os.environ.get('PER_TICKER_PARQUET_DIR'):
-        os.environ['PER_TICKER_PARQUET_DIR'] = parquet_dir_input
-        try:
-            _autofind_parquet_path.clear()
-        except Exception:
-            pass
+    # Normalize and set env on change
+    if parquet_dir_input:
+        p = parquet_dir_input.strip().strip('"').strip("'")
+        p = os.path.normpath(p)
+        if p != os.environ.get('PER_TICKER_PARQUET_DIR'):
+            os.environ['PER_TICKER_PARQUET_DIR'] = p
+            try:
+                # Clear all cache to ensure new path is used
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.experimental_rerun()
+    # Quick existence hint
+    try:
+        cur = os.environ.get('PER_TICKER_PARQUET_DIR')
+        if cur:
+            st.caption(f"Using directory: {cur}{' (exists)' if os.path.isdir(cur) else ' (not found)'}")
+    except Exception:
+        pass
 
 with st.sidebar:
     ticker = st.text_input("Ticker", value="AAPL").strip().upper()
@@ -1707,7 +1720,16 @@ with tab1:
                             if pq_path_hint:
                                 st.caption(f"Parquet source: {pq_path_hint}")
                             else:
-                                st.caption("Parquet source: not found — set directory in sidebar.")
+                                st.caption("Parquet source: not found - set directory in sidebar.")
+                                curdir = os.environ.get('PER_TICKER_PARQUET_DIR')
+                                if curdir and os.path.isdir(curdir):
+                                    try:
+                                        import glob as _glob
+                                        some = sorted(_glob.glob(os.path.join(curdir, '*.parquet')))[:5]
+                                        if some:
+                                            st.caption(f"Example files in directory: {[os.path.basename(x) for x in some]}")
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
                         mode = st.selectbox("Study", [
