@@ -153,6 +153,20 @@ def style_axes(fig: go.Figure, dark: bool, rows: int):
 with st.sidebar:
     st.header("Controls")
 
+# Allow overriding the per-ticker Parquet directory from the UI for reliability
+with st.sidebar:
+    try:
+        default_parquet_dir = os.environ.get('PER_TICKER_PARQUET_DIR') or f"C:/Users/{os.environ.get('USERNAME','')}/Documents/Visual Code/Polygon Data/per_ticker_daily"
+    except Exception:
+        default_parquet_dir = ""
+    parquet_dir_input = st.text_input("Per-ticker Parquet directory", value=default_parquet_dir)
+    if parquet_dir_input and parquet_dir_input != os.environ.get('PER_TICKER_PARQUET_DIR'):
+        os.environ['PER_TICKER_PARQUET_DIR'] = parquet_dir_input
+        try:
+            _autofind_parquet_path.clear()
+        except Exception:
+            pass
+
 with st.sidebar:
     ticker = st.text_input("Ticker", value="AAPL").strip().upper()
     interval = st.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m", "1m"], index=0)
@@ -808,12 +822,21 @@ def _autofind_parquet_path(ticker: str) -> str | None:
     from pathlib import Path
     t = ticker.strip().upper()
     fname = f"{t}.parquet"
+    # Also consider alternative filename variants for symbols with punctuation
+    alt_names = {fname}
+    base = t
+    for repl in (('.', '_'), ('/', '_'), ('-', '_'), (' ', '_')):
+        base = t.replace(repl[0], repl[1])
+        alt_names.add(f"{base}.parquet")
+    alt_names.add(f"{t.replace('.', '')}.parquet")
     # 1) Env var
     env_dir = os.environ.get('PER_TICKER_PARQUET_DIR')
     if env_dir:
-        p = _normalize_host_path(os.path.join(env_dir, fname))
-        if p and os.path.exists(p):
-            return p
+        # Try exact and alternate names
+        for nm in list(alt_names):
+            p = _normalize_host_path(os.path.join(env_dir, nm))
+            if p and os.path.exists(p):
+                return p
     # 2) Windows Documents (standard + 'Visual Code' layout)
     common_dirs = [
         # Standard Documents
@@ -836,9 +859,26 @@ def _autofind_parquet_path(ticker: str) -> str | None:
         str(Path.cwd() / 'per_ticker_daily'),
     ]
     for d in common_dirs:
-        p = _normalize_host_path(os.path.join(d, fname))
-        if p and os.path.exists(p):
-            return p
+        # Try direct matches first
+        for nm in list(alt_names):
+            p = _normalize_host_path(os.path.join(d, nm))
+            if p and os.path.exists(p):
+                return p
+        # Fallback: scan directory and match by alphanumeric-only stem
+        try:
+            from pathlib import Path as _P
+            dd = _P(_normalize_host_path(d))
+            if dd.exists():
+                want = ''.join(ch for ch in t if ch.isalnum())
+                for fp in dd.glob('*.parquet'):
+                    stem = fp.stem
+                    if stem.endswith('.csv'):
+                        stem = stem[:-4]
+                    key = ''.join(ch for ch in stem.upper() if ch.isalnum())
+                    if key == want:
+                        return str(fp)
+        except Exception:
+            pass
     return None
 
 @st.cache_data(show_spinner=False)
