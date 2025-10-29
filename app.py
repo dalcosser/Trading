@@ -11,6 +11,33 @@ import time
 import os
 import json
 from typing import Optional
+import os as _os_for_parquet_default
+from pathlib import Path as _P_DEFAULT
+
+# Force a sane default for per-ticker Parquet directory so the app "just works".
+# Prefer an existing directory with parquet files, trying both per_ticker_daily
+# and per_ticker_daily_ohlcv under Visual Code and Documents.
+try:
+    if not _os_for_parquet_default.environ.get('PER_TICKER_PARQUET_DIR'):
+        _home = _P_DEFAULT.home()
+        _cands = [
+            _home / 'Documents' / 'Visual Code' / 'Polygon Data' / 'per_ticker_daily',
+            _home / 'Documents' / 'Visual Code' / 'Polygon Data' / 'per_ticker_daily_ohlcv',
+            _home / 'Documents' / 'Polygon Data' / 'per_ticker_daily',
+            _home / 'Documents' / 'Polygon Data' / 'per_ticker_daily_ohlcv',
+        ]
+        _pick = None
+        for c in _cands:
+            try:
+                if c.is_dir() and any(c.glob('*.parquet')):
+                    _pick = str(c)
+                    break
+            except Exception:
+                continue
+        if _pick:
+            _os_for_parquet_default.environ['PER_TICKER_PARQUET_DIR'] = _pick
+except Exception:
+    pass
 try:
     import pandas_ta as pta  # for candlestick pattern detection
     HAS_PANDAS_TA = True
