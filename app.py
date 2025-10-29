@@ -157,7 +157,23 @@ with st.sidebar:
 # Allow overriding the per-ticker Parquet directory from the UI for reliability
 with st.sidebar:
     try:
-        default_parquet_dir = os.environ.get('PER_TICKER_PARQUET_DIR') or f"C:/Users/{os.environ.get('USERNAME','')}/Documents/Visual Code/Polygon Data/per_ticker_daily"
+        from pathlib import Path as _Path
+        env_dir = os.environ.get('PER_TICKER_PARQUET_DIR')
+        if env_dir:
+            default_parquet_dir = env_dir
+        else:
+            _home = _Path.home()
+            _candidates = [
+                _home / 'Documents' / 'Visual Code' / 'Polygon Data' / 'per_ticker_daily',
+                _home / 'Documents' / 'Polygon Data' / 'per_ticker_daily',
+            ]
+            default_parquet_dir = ''
+            for _c in _candidates:
+                if _c.exists():
+                    default_parquet_dir = str(_c)
+                    break
+            if not default_parquet_dir:
+                default_parquet_dir = str(_candidates[0])
     except Exception:
         default_parquet_dir = ""
     parquet_dir_input = st.text_input("Per-ticker Parquet directory", value=default_parquet_dir)
@@ -177,7 +193,40 @@ with st.sidebar:
     try:
         cur = os.environ.get('PER_TICKER_PARQUET_DIR')
         if cur:
-            st.caption(f"Using directory: {cur}{' (exists)' if os.path.isdir(cur) else ' (not found)'}")
+            exists = os.path.isdir(cur)
+            st.caption(f"Using directory: {cur}{' (exists)' if exists else ' (not found)'}")
+            # If not found, try to auto-discover a correct directory under Documents
+            if not exists:
+                try:
+                    from pathlib import Path as _Path
+                    roots = []
+                    try:
+                        roots.append(_Path.home() / 'Documents')
+                    except Exception:
+                        pass
+                    roots.append(_Path('C:/Users') / os.environ.get('USERNAME','') / 'Documents')
+                    auto_found = None
+                    for r in roots:
+                        if not r.exists():
+                            continue
+                        for d in r.rglob('per_ticker_daily*'):
+                            if d.is_dir():
+                                try:
+                                    has_pq = any(d.glob('*.parquet'))
+                                except Exception:
+                                    has_pq = False
+                                if has_pq:
+                                    auto_found = str(d)
+                                    break
+                        if auto_found:
+                            break
+                    if auto_found:
+                        os.environ['PER_TICKER_PARQUET_DIR'] = auto_found
+                        st.caption(f"Auto-detected directory: {auto_found}")
+                        st.cache_data.clear()
+                        st.experimental_rerun()
+                except Exception:
+                    pass
     except Exception:
         pass
 
