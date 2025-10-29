@@ -18,7 +18,7 @@ except Exception:
     HAS_PANDAS_TA = False
 
 st.set_page_config(page_title="Codex TA Toolkit", layout="wide")
-st.title("?? Codex TA Toolkit")
+st.title("Codex TA Toolkit")
 
 # ---------------- Theme / Appearance ----------------
 def apply_theme(choice: str) -> str:
@@ -185,7 +185,7 @@ with st.sidebar:
             end = st.date_input("End", value=date.today())
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["?? Chart", "?? Options", "?? TradingView"])
+tab1, tab2, tab3 = st.tabs(["Chart", "Options", "TradingView"])
 
 # ---------------- Chart tab controls ----------------
 with st.sidebar:
@@ -1698,14 +1698,23 @@ with tab1:
 
                     # --- Historical Stats (from uploaded Excel only) ---
                     with st.expander("Historical Gap/Drop Stats"):
-                        uploaded_excel = st.file_uploader("Upload report Excel (*.xlsx)", type=["xlsx","xls"], key="reports_excel_upload")
+                        # Parquet-first: no Excel upload; rely on per-ticker parquet dir
                         stats_ticker = ticker
+                        # Show which parquet path will be used (if found)
+                        try:
+                            pq_path_hint = _autofind_parquet_path(stats_ticker)
+                            if pq_path_hint:
+                                st.caption(f"Parquet source: {pq_path_hint}")
+                            else:
+                                st.caption("Parquet source: not found — set directory in sidebar.")
+                        except Exception:
+                            pass
                         mode = st.selectbox("Study", [
                             "Close down N% day -> next day",
                             "Gap up/down >= N% -> same day + next day",
                         ], index=0)
                         threshold = st.number_input(
-                            "Threshold (%) ï¿½ use + for up, - for down",
+                            "Threshold (%) — use + for up, - for down",
                             min_value=-50.0,
                             max_value=50.0,
                             value=-3.0,
@@ -1715,20 +1724,19 @@ with tab1:
                         run = st.button("Run stats", key="run_gap_stats")
                         if run:
                             try:
-                                # Prefer Parquet auto-discovery; fall back to uploaded/auto-located Excel
-                                auto_path = _autofind_report_excel_path(stats_ticker)
+                                # Load strictly from per-ticker Parquet (no Excel dependency)
                                 daily_hist = _load_polygon_daily_for_ticker(
                                     data_root="",
                                     ticker=stats_ticker,
                                     reports_dir=None,
                                     technicals_script=None,
                                     auto_generate_report=False,
-                                    excel_override=uploaded_excel,
-                                    excel_path_override=auto_path,
+                                    excel_override=None,
+                                    excel_path_override=None,
                                     allow_yahoo_fallback=False,
                                 )
                                 if daily_hist is None or daily_hist.empty:
-                                    st.error("No historical data available from Parquet or Excel.")
+                                    st.error("No historical data available from Parquet. Set 'Per-ticker Parquet directory' in the sidebar and ensure <TICKER>.parquet exists.")
                                     st.stop()
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
                                 thr = float(threshold)
@@ -2219,3 +2227,6 @@ with tab2:
 
         except Exception as e:
             st.error(f"Options error: {e}")
+
+
+
