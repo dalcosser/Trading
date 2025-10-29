@@ -1675,34 +1675,20 @@ with tab1:
                         run = st.button("Run stats", key="run_gap_stats")
                         if run:
                             try:
-                                daily_hist = None
-                                # Prefer uploaded file; else silently auto-locate
-                                if uploaded_excel is not None:
-                                    daily_hist = _load_polygon_daily_for_ticker(
-                                        data_root="",
-                                        ticker=stats_ticker,
-                                        reports_dir=None,
-                                        technicals_script=None,
-                                        auto_generate_report=False,
-                                        excel_override=uploaded_excel,
-                                        excel_path_override=None,
-                                        allow_yahoo_fallback=False,
-                                    )
-                                else:
-                                    auto_path = _autofind_report_excel_path(stats_ticker)
-                                    if auto_path:
-                                        daily_hist = _load_polygon_daily_for_ticker(
-                                            data_root="",
-                                            ticker=stats_ticker,
-                                            reports_dir=None,
-                                            technicals_script=None,
-                                            auto_generate_report=False,
-                                            excel_override=None,
-                                            excel_path_override=auto_path,
-                                            allow_yahoo_fallback=False,
-                                        )
+                                # Prefer Parquet auto-discovery; fall back to uploaded/auto-located Excel
+                                auto_path = _autofind_report_excel_path(stats_ticker)
+                                daily_hist = _load_polygon_daily_for_ticker(
+                                    data_root="",
+                                    ticker=stats_ticker,
+                                    reports_dir=None,
+                                    technicals_script=None,
+                                    auto_generate_report=False,
+                                    excel_override=uploaded_excel,
+                                    excel_path_override=auto_path,
+                                    allow_yahoo_fallback=False,
+                                )
                                 if daily_hist is None or daily_hist.empty:
-                                    st.error("No historical data available. Upload a report Excel to compute stats.")
+                                    st.error("No historical data available from Parquet or Excel.")
                                     st.stop()
                                 m = 'close_drop' if mode.startswith("Close") else 'gap'
                                 thr = float(threshold)
@@ -2193,4 +2179,3 @@ with tab2:
 
         except Exception as e:
             st.error(f"Options error: {e}")
-
