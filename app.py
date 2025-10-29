@@ -38,6 +38,27 @@ try:
                 break
         except Exception:
             continue
+    # If not found yet, recursively search common roots for any per_ticker_daily* with parquet
+    if _pick is None:
+        _roots = [
+            _home / 'Documents',
+            _home / 'Documents' / 'Visual Code',
+        ]
+        for r in _roots:
+            try:
+                if not r.exists():
+                    continue
+                for d in r.rglob('per_ticker_daily*'):
+                    try:
+                        if d.is_dir() and any(d.glob('*.parquet')):
+                            _pick = str(d)
+                            break
+                    except Exception:
+                        continue
+                if _pick:
+                    break
+            except Exception:
+                continue
     if _pick:
         # Unconditionally set so we always use a working directory
         _os_for_parquet_default.environ['PER_TICKER_PARQUET_DIR'] = _pick
