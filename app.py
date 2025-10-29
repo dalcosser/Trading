@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1706,7 +1707,7 @@ with tab1:
                             if pq_path_hint:
                                 st.caption(f"Parquet source: {pq_path_hint}")
                             else:
-                                st.caption("Parquet source: not found � set directory in sidebar.")
+                                st.caption("Parquet source: not found — set directory in sidebar.")
                         except Exception:
                             pass
                         mode = st.selectbox("Study", [
@@ -1714,7 +1715,7 @@ with tab1:
                             "Gap up/down >= N% -> same day + next day",
                         ], index=0)
                         threshold = st.number_input(
-                            "Threshold (%) � use + for up, - for down",
+                            "Threshold (%) — use + for up, - for down",
                             min_value=-50.0,
                             max_value=50.0,
                             value=-3.0,
@@ -2141,7 +2142,7 @@ with tab2:
             with f2:
                 min_vol = st.number_input("Min Volume", value=0, min_value=0, step=10)
             with f3:
-                moneyness = st.selectbox("Moneyness", ["All", "OTM", "ATM (�1%)", "ITM"])
+                moneyness = st.selectbox("Moneyness", ["All", "OTM", "ATM (ï¿½1%)", "ITM"])
 
             # moneyness tagging (uses spot S if available)
             def tag_filter(df: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -2162,7 +2163,7 @@ with tab2:
                         out = out[~itm_mask]
                     elif moneyness == "ITM":
                         out = out[itm_mask]
-                    elif moneyness == "ATM (�1%)":
+                    elif moneyness == "ATM (ï¿½1%)":
                         out = out[abs(out["moneyness"]) <= 0.01]
                 if "open_interest" in out.columns:
                     out = out[out["open_interest"].fillna(0) >= min_oi]
@@ -2193,7 +2194,7 @@ with tab2:
                 if "open_interest" in pp.columns:
                     fig_oi.add_trace(go.Scatter(x=pp["strike"], y=pp["open_interest"], mode="lines+markers", name="Puts OI"))
                 add_vline(fig_oi, S, "Spot")
-                fig_oi.update_layout(title=f"Open Interest by Strike � {sel}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
+                fig_oi.update_layout(title=f"Open Interest by Strike ï¿½ {sel}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
                 st.plotly_chart(fig_oi, use_container_width=True)
 
             if show_vol_chart:
@@ -2203,7 +2204,7 @@ with tab2:
                 if "volume" in pp.columns:
                     fig_vol.add_trace(go.Scatter(x=pp["strike"], y=pp["volume"], mode="lines+markers", name="Puts Volume"))
                 add_vline(fig_vol, S, "Spot")
-                fig_vol.update_layout(title=f"Volume by Strike � {sel}", xaxis_title="Strike", yaxis_title="Volume", height=380)
+                fig_vol.update_layout(title=f"Volume by Strike ï¿½ {sel}", xaxis_title="Strike", yaxis_title="Volume", height=380)
                 st.plotly_chart(fig_vol, use_container_width=True)
 
             if show_iv_chart:
@@ -2213,7 +2214,7 @@ with tab2:
                 if "implied_volatility" in pp.columns:
                     fig_iv.add_trace(go.Scatter(x=pp["strike"], y=pp["implied_volatility"]*100, mode="lines+markers", name="Puts IV%"))
                 add_vline(fig_iv, S, "Spot")
-                fig_iv.update_layout(title=f"Implied Volatility (Smile) � {sel}", xaxis_title="Strike", yaxis_title="IV (%)", height=380)
+                fig_iv.update_layout(title=f"Implied Volatility (Smile) ï¿½ {sel}", xaxis_title="Strike", yaxis_title="IV (%)", height=380)
                 st.plotly_chart(fig_iv, use_container_width=True)
 
             # theme for options charts (match main)
@@ -2221,7 +2222,7 @@ with tab2:
                 pass  # (plotly template is fine; page-wide colors already set)
 
             if S is not None:
-                st.caption(f"Spot � {S:.2f} | Expirations: {len(exps)} | Showing: {sel}")
+                st.caption(f"Spot ï¿½ {S:.2f} | Expirations: {len(exps)} | Showing: {sel}")
             else:
                 st.caption(f"Spot unavailable | Expirations: {len(exps)} | Showing: {sel}")
 
