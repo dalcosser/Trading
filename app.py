@@ -905,21 +905,26 @@ def _autofind_parquet_path(ticker: str) -> str | None:
         # Standard Documents
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily_tech",
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily",
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily_ohlcv",
         # Visual Code workspace under Documents
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily_tech",
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily",
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily_ohlcv",
     ]
     # 3) WSL equivalents
     common_dirs += [
         f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Polygon Data/per_ticker_daily_tech",
         f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Polygon Data/per_ticker_daily",
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Polygon Data/per_ticker_daily_ohlcv",
         f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Visual Code/Polygon Data/per_ticker_daily_tech",
         f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Visual Code/Polygon Data/per_ticker_daily",
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Visual Code/Polygon Data/per_ticker_daily_ohlcv",
     ]
     # 4) Local under CWD
     common_dirs += [
         str(Path.cwd() / 'per_ticker_daily_tech'),
         str(Path.cwd() / 'per_ticker_daily'),
+        str(Path.cwd() / 'per_ticker_daily_ohlcv'),
     ]
     for d in common_dirs:
         # Try direct matches first
