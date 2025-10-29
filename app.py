@@ -928,6 +928,12 @@ def _autofind_parquet_path(ticker: str) -> str | None:
             if p and os.path.exists(p):
                 return p
     # 2) Windows Documents (standard + 'Visual Code' layout)
+    # App directory (so it works regardless of launch CWD)
+    try:
+        _APP_DIR = str(Path(__file__).resolve().parent)
+    except Exception:
+        _APP_DIR = ''
+
     common_dirs = [
         # Standard Documents
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily_tech",
@@ -937,6 +943,10 @@ def _autofind_parquet_path(ticker: str) -> str | None:
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily_tech",
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily",
         f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily_ohlcv",
+        # Next to the app file
+        (os.path.join(_APP_DIR, 'per_ticker_daily_tech') if _APP_DIR else ''),
+        (os.path.join(_APP_DIR, 'per_ticker_daily') if _APP_DIR else ''),
+        (os.path.join(_APP_DIR, 'per_ticker_daily_ohlcv') if _APP_DIR else ''),
     ]
     # 3) WSL equivalents
     common_dirs += [
