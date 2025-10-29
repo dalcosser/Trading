@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -18,7 +18,7 @@ except Exception:
     HAS_PANDAS_TA = False
 
 st.set_page_config(page_title="Codex TA Toolkit", layout="wide")
-st.title("📈 Codex TA Toolkit")
+st.title("?? Codex TA Toolkit")
 
 # ---------------- Theme / Appearance ----------------
 def apply_theme(choice: str) -> str:
@@ -171,7 +171,7 @@ with st.sidebar:
             end = st.date_input("End", value=date.today())
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Chart", "🧾 Options", "📺 TradingView"])
+tab1, tab2, tab3 = st.tabs(["?? Chart", "?? Options", "?? TradingView"])
 
 # ---------------- Chart tab controls ----------------
 with st.sidebar:
@@ -793,6 +793,55 @@ def _normalize_host_path(p: str | None) -> str | None:
         return p
 
 @st.cache_data(show_spinner=False)
+def _autofind_parquet_path(ticker: str) -> str | None:
+    """
+    Try to locate a per-ticker parquet like <TICKER>.parquet in common folders
+    without surfacing paths in the UI.
+    Order:
+      1) PER_TICKER_PARQUET_DIR env var
+      2) Common Windows Documents paths (per_ticker_daily_tech, per_ticker_daily)
+      3) WSL equivalents
+      4) ./per_ticker_daily_tech or ./per_ticker_daily under CWD
+    Returns a normalized path or None.
+    """
+    import os
+    from pathlib import Path
+    t = ticker.strip().upper()
+    fname = f"{t}.parquet"
+    # 1) Env var
+    env_dir = os.environ.get('PER_TICKER_PARQUET_DIR')
+    if env_dir:
+        p = _normalize_host_path(os.path.join(env_dir, fname))
+        if p and os.path.exists(p):
+            return p
+    # 2) Windows Documents (standard + 'Visual Code' layout)
+    common_dirs = [
+        # Standard Documents
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily_tech",
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Polygon Data/per_ticker_daily",
+        # Visual Code workspace under Documents
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily_tech",
+        f"C:/Users/{os.environ.get('USERNAME', '')}/Documents/Visual Code/Polygon Data/per_ticker_daily",
+    ]
+    # 3) WSL equivalents
+    common_dirs += [
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Polygon Data/per_ticker_daily_tech",
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Polygon Data/per_ticker_daily",
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Visual Code/Polygon Data/per_ticker_daily_tech",
+        f"/mnt/c/Users/{os.environ.get('USERNAME', '').lower()}/Documents/Visual Code/Polygon Data/per_ticker_daily",
+    ]
+    # 4) Local under CWD
+    common_dirs += [
+        str(Path.cwd() / 'per_ticker_daily_tech'),
+        str(Path.cwd() / 'per_ticker_daily'),
+    ]
+    for d in common_dirs:
+        p = _normalize_host_path(os.path.join(d, fname))
+        if p and os.path.exists(p):
+            return p
+    return None
+
+@st.cache_data(show_spinner=False)
 def _autofind_report_excel_path(ticker: str) -> str | None:
     """
     Try to locate <TICKER>_technicals.xlsx without showing paths in the UI.
@@ -862,6 +911,26 @@ def _load_polygon_daily_for_ticker(
 
     t = ticker.strip().upper()
     df = None
+    # 0) Prefer per-ticker parquet if present (already contains technicals)
+    try:
+        pq_path = _autofind_parquet_path(t)
+        if pq_path and os.path.exists(pq_path):
+            df_pq = pd.read_parquet(pq_path)
+            if isinstance(df_pq, pd.DataFrame) and not df_pq.empty:
+                # Normalize to expected columns
+                cols = {str(c).lower(): c for c in df_pq.columns}
+                date_col = cols.get('timestamp') or cols.get('date')
+                if date_col is not None:
+                    out = pd.DataFrame({'Date': pd.to_datetime(df_pq[date_col], errors='coerce')})
+                    for c in ('Open','High','Low','Close','Volume'):
+                        src = cols.get(c.lower())
+                        if src is not None and src in df_pq.columns:
+                            out[c] = pd.to_numeric(df_pq[src], errors='coerce')
+                    out = out.dropna(subset=['Date','Close']) if 'Close' in out.columns else out.dropna(subset=['Date'])
+                    out = out.sort_values('Date').reset_index(drop=True)
+                    return out
+    except Exception:
+        pass
     # 0) If a file-like Excel was provided (uploaded), parse it first
     if excel_override is not None:
         try:
@@ -1596,7 +1665,7 @@ with tab1:
                             "Gap up/down >= N% -> same day + next day",
                         ], index=0)
                         threshold = st.number_input(
-                            "Threshold (%) — use + for up, - for down",
+                            "Threshold (%) � use + for up, - for down",
                             min_value=-50.0,
                             max_value=50.0,
                             value=-3.0,
@@ -1644,13 +1713,13 @@ with tab1:
                                     c1,c2,c3,c4 = st.columns(4)
                                     if m == 'close_drop':
                                         with c1:
-                                            st.metric("Avg Close→Close %", f"{result_df['Close_to_Close_%'].mean():.2f}%")
+                                            st.metric("Avg Close?Close %", f"{result_df['Close_to_Close_%'].mean():.2f}%")
                                         with c2:
                                             st.metric("Avg Next Overnight %", f"{result_df['Next_Overnight_%'].mean():.2f}%")
                                         with c3:
                                             st.metric("Avg Next Intraday %", f"{result_df['Next_Intraday_%'].mean():.2f}%")
                                         with c4:
-                                            st.metric("Avg Next Close→Close %", f"{result_df['Next_Close_to_Close_%'].mean():.2f}%")
+                                            st.metric("Avg Next Close?Close %", f"{result_df['Next_Close_to_Close_%'].mean():.2f}%")
                                     else:
                                         with c1:
                                             st.metric("Avg Intraday %", f"{result_df['Intraday_%'].mean():.2f}%")
@@ -1789,7 +1858,7 @@ def is_equity_symbol(sym: str) -> bool:
 def fetch_expirations(ticker: str, cache_buster: str | None = None) -> list[str]:
     """Fetch option expirations: Polygon -> yfinance -> yahooquery. Records diagnostics in session."""
     st.session_state['opt_errors'] = []
-    # Decide order: equities -> yahooquery → yfinance → polygon; others -> polygon → yfinance → yahooquery
+    # Decide order: equities -> yahooquery ? yfinance ? polygon; others -> polygon ? yfinance ? yahooquery
     eq = is_equity_symbol(ticker)
     # Polygon first (if key present)
     try:
@@ -2038,7 +2107,7 @@ with tab2:
             with f2:
                 min_vol = st.number_input("Min Volume", value=0, min_value=0, step=10)
             with f3:
-                moneyness = st.selectbox("Moneyness", ["All", "OTM", "ATM (±1%)", "ITM"])
+                moneyness = st.selectbox("Moneyness", ["All", "OTM", "ATM (�1%)", "ITM"])
 
             # moneyness tagging (uses spot S if available)
             def tag_filter(df: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -2059,7 +2128,7 @@ with tab2:
                         out = out[~itm_mask]
                     elif moneyness == "ITM":
                         out = out[itm_mask]
-                    elif moneyness == "ATM (±1%)":
+                    elif moneyness == "ATM (�1%)":
                         out = out[abs(out["moneyness"]) <= 0.01]
                 if "open_interest" in out.columns:
                     out = out[out["open_interest"].fillna(0) >= min_oi]
@@ -2090,7 +2159,7 @@ with tab2:
                 if "open_interest" in pp.columns:
                     fig_oi.add_trace(go.Scatter(x=pp["strike"], y=pp["open_interest"], mode="lines+markers", name="Puts OI"))
                 add_vline(fig_oi, S, "Spot")
-                fig_oi.update_layout(title=f"Open Interest by Strike — {sel}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
+                fig_oi.update_layout(title=f"Open Interest by Strike � {sel}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
                 st.plotly_chart(fig_oi, use_container_width=True)
 
             if show_vol_chart:
@@ -2100,7 +2169,7 @@ with tab2:
                 if "volume" in pp.columns:
                     fig_vol.add_trace(go.Scatter(x=pp["strike"], y=pp["volume"], mode="lines+markers", name="Puts Volume"))
                 add_vline(fig_vol, S, "Spot")
-                fig_vol.update_layout(title=f"Volume by Strike — {sel}", xaxis_title="Strike", yaxis_title="Volume", height=380)
+                fig_vol.update_layout(title=f"Volume by Strike � {sel}", xaxis_title="Strike", yaxis_title="Volume", height=380)
                 st.plotly_chart(fig_vol, use_container_width=True)
 
             if show_iv_chart:
@@ -2110,7 +2179,7 @@ with tab2:
                 if "implied_volatility" in pp.columns:
                     fig_iv.add_trace(go.Scatter(x=pp["strike"], y=pp["implied_volatility"]*100, mode="lines+markers", name="Puts IV%"))
                 add_vline(fig_iv, S, "Spot")
-                fig_iv.update_layout(title=f"Implied Volatility (Smile) — {sel}", xaxis_title="Strike", yaxis_title="IV (%)", height=380)
+                fig_iv.update_layout(title=f"Implied Volatility (Smile) � {sel}", xaxis_title="Strike", yaxis_title="IV (%)", height=380)
                 st.plotly_chart(fig_iv, use_container_width=True)
 
             # theme for options charts (match main)
@@ -2118,9 +2187,10 @@ with tab2:
                 pass  # (plotly template is fine; page-wide colors already set)
 
             if S is not None:
-                st.caption(f"Spot ≈ {S:.2f} | Expirations: {len(exps)} | Showing: {sel}")
+                st.caption(f"Spot � {S:.2f} | Expirations: {len(exps)} | Showing: {sel}")
             else:
                 st.caption(f"Spot unavailable | Expirations: {len(exps)} | Showing: {sel}")
 
         except Exception as e:
             st.error(f"Options error: {e}")
+
