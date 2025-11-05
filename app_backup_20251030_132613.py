@@ -1,80 +1,14 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as _np
 import os
 from pathlib import Path
-
-
-# Optional Bloomberg via xbbg
-HAS_XBBG = False
-try:
-    from xbbg import blp  # type: ignore
-    HAS_XBBG = True
-except BaseException:
-    # xbbg may raise a pytest Skip exception when blpapi is not present; catch broadly.
-    blp = None  # type: ignore
-    HAS_XBBG = False
-
-# Best-effort load of .env so POLYGON/ALPACA keys are available when running from PowerShell
-_DOTENV_PATH = None
-try:
-    from dotenv import load_dotenv, find_dotenv  # type: ignore
-    # Load nearest .env found by walking up, then a local .env next to this file
-    _DOTENV_PATH = find_dotenv()
-    load_dotenv(_DOTENV_PATH, override=False)
-    load_dotenv(Path(__file__).with_name('.env'), override=False)
-except Exception:
-    # Also try master .env under Documents/StockScreener
-    pass
-
-# Minimal fallback if python-dotenv is unavailable: read local and master .env
-try:
-    def _read_env_file(pth: Path):
-        if pth.exists():
-            for raw in pth.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip(); v = v.strip()
-                if k and (k not in os.environ or not os.environ[k]):
-                    os.environ[k] = v
-    _read_env_file(Path(__file__).with_name(".env"))
-    _read_env_file(Path.home() / "Documents" / "StockScreener" / ".env")
-except Exception:
-    pass
-    try:
-        from pathlib import Path as _P
-        _master_env = _P.home() / "Documents" / "StockScreener" / ".env"
-        load_dotenv(_master_env, override=False)
-    except Exception:
-        pass
-    pass
 
 # Pin per‑ticker Parquet folder next to this app file for deterministic startup
 DATA_DIR = Path(__file__).resolve().parent / "per_ticker_daily"
 os.environ["PER_TICKER_PARQUET_DIR"] = str(DATA_DIR)
 
 # ============== Scans: robust helpers ==============
-
-def _bbg_quote(sym: str) -> dict | None:
-    if not HAS_XBBG or not sym:
-        return None
-    try:
-        tkr = f"{sym.strip().upper()} US Equity" if " " not in sym.strip() else sym.strip()
-        dfb = blp.bdp(tickers=[tkr], flds=["PX_LAST","PX_VOLUME","NAME"])
-        if dfb is None or dfb.empty:
-            return None
-        rec = dfb.iloc[0]
-        return {
-            "Ticker": sym.strip().upper(),
-            "Name": rec.get("NAME") if "NAME" in dfb.columns else rec.get("name"),
-            "Price": rec.get("PX_LAST") if "PX_LAST" in dfb.columns else rec.get("px_last"),
-            "Volume": rec.get("PX_VOLUME") if "PX_VOLUME" in dfb.columns else rec.get("px_volume"),
-        }
-    except Exception:
-        return None
-
 from pathlib import Path
 import numpy as _np
 
@@ -265,149 +199,6 @@ def _rs_52w_high(df_t: pd.DataFrame, df_spy: pd.DataFrame, lookback: int = 252) 
     ev['Next_Close'] = m['Close_T'].shift(-1)
     ev['Next_Overnight_%'] = (ev['Next_Close'] / ev['Close_T'] - 1.0) * 100.0
     return ev.dropna(subset=['RS_52wHigh'])
-
-# --- Overnight backtest helpers ---
-def _true_range(h: pd.Series, l: pd.Series, pc: pd.Series) -> pd.Series:
-    a = (h - l).abs()
-    b = (h - pc).abs()
-    c = (l - pc).abs()
-    return pd.concat([a, b, c], axis=1).max(axis=1)
-
-def _atr_percent(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    g = df.sort_values('Date').copy()
-    pc = g['Close'].shift(1)
-    tr = _true_range(g['High'], g['Low'], pc)
-    atr = tr.rolling(n, min_periods=n).mean()
-    with pd.option_context('mode.use_inf_as_na', True):
-        atr_pct = (atr / g['Close']) * 100.0
-    return atr_pct.rename(f'ATR%({n})')
-
-def _build_signal_mask(df: pd.DataFrame, strategy: str, thr: float, atr_n: int, atr_change_type: str | None = None) -> pd.Series:
-    g = df.sort_values('Date').copy()
-    if strategy.startswith('ATR change'):
-        atrp = _atr_percent(g, int(atr_n))
-        # Decide how to treat ATR% changes
-        ch = atrp.diff()
-        t = float(thr)
-        ctype = (atr_change_type or 'Absolute').lower()
-        if ctype.startswith('increase'):
-            mask = (ch >= t)
-        elif ctype.startswith('decrease'):
-            mask = (ch <= -t)
-        else:
-            mask = (ch.abs() >= t)
-        return mask.reindex(g.index).fillna(False)
-    if strategy.startswith('Gap'):
-        prevc = g['Close'].shift(1)
-        gap = (g['Open'] / prevc - 1.0) * 100.0
-        s = float(thr)
-        return (_np.sign(s) * gap >= abs(s)).reindex(g.index).fillna(False)
-    # Close-to-close change
-    cc = (g['Close'] / g['Close'].shift(1) - 1.0) * 100.0
-    s = float(thr)
-    return (_np.sign(s) * cc >= abs(s)).reindex(g.index).fillna(False)
-
-def _overnight_results(df: pd.DataFrame, mask: pd.Series) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    g = df.sort_values('Date').copy()
-    g['NextOpen'] = g['Open'].shift(-1)
-    # Returns
-    g['Overnight_%'] = (g['NextOpen'] / g['Close'] - 1.0) * 100.0
-    g['Day_%'] = (g['Close'] / g['Open'] - 1.0) * 100.0
-    sig = mask.reindex(g.index).fillna(False)
-    ev = g[sig].copy()
-    # Equity curves (apply return on signal rows, flat otherwise)
-    ov = (1.0 + (g['Overnight_%'].fillna(0.0) / 100.0))
-    dy = (1.0 + (g['Day_%'].fillna(0.0) / 100.0))
-    # Multiply only on signal days
-    ov_sig = ov.where(sig, 1.0).cumprod()
-    dy_sig = dy.where(sig, 1.0).cumprod()
-    ov_sig.name = 'Equity_OV'
-    dy_sig.name = 'Equity_DAY'
-    return ev[['Date','Open','High','Low','Close','Overnight_%','Day_%']], ov_sig, dy_sig
-
-# --- Earnings helpers ---
-def _get_earnings_dates_yf(ticker: str, limit: int = 40) -> list:
-    try:
-        t = yf.Ticker((ticker or '').strip())
-        dfed = t.get_earnings_dates(limit=limit)
-        if dfed is None or getattr(dfed, 'empty', True):
-            return []
-        # yfinance typically returns a DatetimeIndex; fallback to column if present
-        if isinstance(dfed.index, pd.DatetimeIndex):
-            return [d.date() for d in dfed.index.to_pydatetime()]
-        for name in ('Earnings Date','earningsDate','date'):
-            if name in getattr(dfed, 'columns', []):
-                s = pd.to_datetime(dfed[name], errors='coerce')
-                return [d.date() for d in s.dropna().to_pydatetime()]
-    except Exception:
-        return []
-    return []
-
-def _earnings_prior_dayof_scan(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Compute prior/day-of stats around earnings.
-    Returns rows for each earnings event with:
-      - EarningsDate, TradeDate (the trading day used for the event)
-      - Prior_% (Close[ED-1]/Close[ED-2] - 1)
-      - Gap_% (Open[ED]/Close[ED-1] - 1)
-      - Intraday_% (Close[ED]/Open[ED] - 1)
-      - Day_% (Close[ED]/Close[ED-1] - 1)
-      - NextDay_% (Close[ED+1]/Close[ED] - 1)
-    """
-    g = df.sort_values('Date').reset_index(drop=True).copy()
-    if 'Date' not in g.columns or 'Close' not in g.columns:
-        return pd.DataFrame()
-    # Normalize types
-    g['Date'] = pd.to_datetime(g['Date'], errors='coerce')
-    for c in ('Open','High','Low','Close'):
-        if c in g.columns:
-            g[c] = pd.to_numeric(g[c], errors='coerce')
-
-    e_dates = _get_earnings_dates_yf(ticker, limit=60)
-    if not e_dates:
-        return pd.DataFrame(columns=['EarningsDate','TradeDate','Prior_%','Gap_%','Intraday_%','Day_%','NextDay_%'])
-
-    out = []
-    dts = g['Date']
-    for ed in e_dates:
-        # find first trading day on/after earnings calendar date
-        mask = dts.dt.date >= ed
-        if not mask.any():
-            continue
-        i = int(mask.idxmax())
-        # prior and next indices
-        i_prev = i - 1
-        i_prev2 = i - 2
-        i_next = i + 1
-        # require previous two days for prior% and day-of calc
-        if i_prev2 < 0 or i_prev < 0:
-            continue
-        try:
-            prior = (g.at[i_prev, 'Close'] / g.at[i_prev2, 'Close'] - 1.0) * 100.0 if pd.notna(g.at[i_prev,'Close']) and pd.notna(g.at[i_prev2,'Close']) else _np.nan
-            gap = _np.nan
-            intr = _np.nan
-            day = _np.nan
-            if 'Open' in g.columns and pd.notna(g.at[i,'Open']) and pd.notna(g.at[i_prev,'Close']):
-                gap = (g.at[i, 'Open'] / g.at[i_prev, 'Close'] - 1.0) * 100.0
-            if 'Open' in g.columns and pd.notna(g.at[i,'Open']) and pd.notna(g.at[i,'Close']):
-                intr = (g.at[i, 'Close'] / g.at[i, 'Open'] - 1.0) * 100.0
-            if pd.notna(g.at[i,'Close']) and pd.notna(g.at[i_prev,'Close']):
-                day = (g.at[i, 'Close'] / g.at[i_prev, 'Close'] - 1.0) * 100.0
-            nextd = _np.nan
-            if i_next < len(g) and pd.notna(g.at[i_next,'Close']) and pd.notna(g.at[i,'Close']):
-                nextd = (g.at[i_next, 'Close'] / g.at[i, 'Close'] - 1.0) * 100.0
-            out.append({
-                'EarningsDate': pd.to_datetime(ed),
-                'TradeDate': g.at[i,'Date'],
-                'Prior_%': prior,
-                'Gap_%': gap,
-                'Intraday_%': intr,
-                'Day_%': day,
-                'NextDay_%': nextd,
-            })
-        except Exception:
-            continue
-    res = pd.DataFrame(out)
-    return res.sort_values('TradeDate').reset_index(drop=True)
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -484,35 +275,6 @@ except Exception:
 st.set_page_config(page_title="Codex TA Toolkit", layout="wide")
 st.title("Codex TA Toolkit")
 
-# --- Data dir banner (hidden unless TA_DEBUG_UI=1) ---
-if os.getenv('TA_DEBUG_UI','') == '1':
-    try:
-        _base = os.environ.get('PER_TICKER_PARQUET_DIR') or ''
-        _cnt_txt = "0"
-        if _base and Path(_base).exists():
-            try:
-                # Fast capped count to avoid scanning very large folders on startup
-                cap = 5000
-                n = 0
-                for _ in Path(_base).glob('*.parquet'):
-                    n += 1
-                    if n >= cap:
-                        _cnt_txt = f"{cap}+"
-                        break
-                else:
-                    _cnt_txt = str(n)
-            except Exception:
-                _cnt_txt = "?"
-        st.caption("Parquet dir: " + (_base or "(unset)") + " | Files: " + _cnt_txt)
-        # Show which .env was loaded (to diagnose missing keys)
-        try:
-            _env_here = Path(__file__).with_name('.env')
-            st.caption(f".env loaded: {(_DOTENV_PATH or '(none via find_dotenv)')} | app .env exists: {_env_here.exists()}")
-        except Exception:
-            pass
-    except Exception:
-        pass
-
 # ---------------- Theme / Appearance ----------------
 def apply_theme(choice: str) -> str:
     """
@@ -575,34 +337,6 @@ def apply_theme(choice: str) -> str:
         border: 1px solid #d0d0d0 !important;
       }
 
-      /* Top nav radio styled as colored chips */
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] {
-        display: flex; gap: 8px; flex-wrap: wrap;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label {
-        border: 1px solid #d0d0d0; border-radius: 999px; padding: 6px 12px; cursor: pointer;
-        background: #f7f7f9; color: #111; transition: all .15s ease;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:hover {
-        box-shadow: inset 0 0 0 2px rgba(0,0,0,0.06);
-      }
-      /* Section colors (Chart, Options, TradingView, Scans, Overnight) */
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:nth-child(1) {
-        background:#e8f0ff; border-color:#3b82f6; color:#0b3a8f;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:nth-child(2) {
-        background:#e7f8ef; border-color:#22c55e; color:#065f46;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:nth-child(3) {
-        background:#f3e8ff; border-color:#8b5cf6; color:#4c1d95;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:nth-child(4) {
-        background:#fff4e5; border-color:#f59e0b; color:#7c2d12;
-      }
-      [data-testid="stAppViewContainer"] .stRadio:nth-of-type(1) [role="radiogroup"] label:nth-child(5) {
-        background:#eef2f7; border-color:#94a3b8; color:#1f2937;
-      }
-
       /* Ensure TradingView embed uses full width */
       .tradingview-widget-container, .tradingview-widget-container__widget {
         width: 100% !important;
@@ -648,8 +382,8 @@ def apply_theme(choice: str) -> str:
         return "plotly_white"
 
 
-def style_axes(fig: go.Figure, dark: bool, rows: int, extra_rangebreaks: list | None = None, minimalist: bool = False, nticks: int | None = None):
-    grid = ("#2a2a2a" if dark else "#eaeaea") if minimalist else ("#333333" if dark else "#cccccc")
+def style_axes(fig: go.Figure, dark: bool, rows: int):
+    grid = "#333333" if dark else "#cccccc"
     fig.update_layout(
         template="plotly_dark" if dark else "plotly_white",
         plot_bgcolor="#000000" if dark else "#ffffff",
@@ -664,26 +398,11 @@ def style_axes(fig: go.Figure, dark: bool, rows: int, extra_rangebreaks: list | 
             font=dict(color="#e6e6e6" if dark else "#111111")
         )
     )
-    # Hide weekend gaps on all x-axes for a continuous look
     for r in range(1, rows + 1):
-        rb = [dict(bounds=["sat", "mon"])]
-        if extra_rangebreaks:
-            rb.extend(extra_rangebreaks)
-        fig.update_xaxes(
-            row=r,
-            col=1,
-            showgrid=True,
-            gridcolor=grid,
-            gridwidth=(0.5 if minimalist else 1),
-            zerolinecolor=grid,
-            tickfont_color="#e6e6e6" if dark else "#111111",
-            rangebreaks=rb,
-            showspikes=False,
-            nticks=(nticks if nticks else None),
-        )
-        fig.update_yaxes(row=r, col=1, showgrid=True, gridcolor=grid, gridwidth=(0.5 if minimalist else 1), zerolinecolor=grid,
-                         tickfont_color="#e6e6e6" if dark else "#111111",
-                         nticks=(nticks if nticks else None))
+        fig.update_xaxes(row=r, col=1, showgrid=True, gridcolor=grid, zerolinecolor=grid,
+                         tickfont_color="#e6e6e6" if dark else "#111111")
+        fig.update_yaxes(row=r, col=1, showgrid=True, gridcolor=grid, zerolinecolor=grid,
+                         tickfont_color="#e6e6e6" if dark else "#111111")
 
 # ---------------- Sidebar (shared) ----------------
 with st.sidebar:
@@ -708,46 +427,51 @@ with st.sidebar:
         with c2:
             end = st.date_input("End", value=date.today())
 
-# Top navigation (replaces tabs)
-nav = st.radio(
-    "Navigation",
-    ["Chart", "Options", "TradingView", "Scans", "Overnight"],
-    horizontal=True,
-    index=0,
-    key="top_nav",
-)
-try:
-    st.session_state['nav'] = nav
-except Exception:
-    pass
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["Chart", "Options", "TradingView", "Scans"])
 
-if False:
-    # Moved to bottom Diagnostics expander
-    pass
+with tab4:
+    with st.expander("Verify data setup"):
+        base = os.environ.get("PER_TICKER_PARQUET_DIR") or ""
+        st.caption(f"Data dir: {base}")
+        try:
+            sample = [p.name for p in list(Path(base).glob("*.parquet"))[:10]] if base else []
+            st.write("Sample files:", sample or "(none)")
+        except Exception as e:
+            st.write("Error listing files:", e)
+        tkr_test = st.text_input("Test ticker (file check)", value="AAPL").strip().upper()
+        if st.button("Run verify"):
+            try:
+                fp = _resolve_parquet_path(tkr_test)
+                st.write("Resolved path:", str(fp) if fp else "(not found)")
+                if not fp:
+                    st.error("File not found. Check ticker vs filename.")
+                else:
+                    dfp = pd.read_parquet(fp)
+                    cols = list(dfp.columns)
+                    st.write("Rows:", len(dfp), "Columns:", cols[:12])
+                    lc = {str(c).lower(): c for c in cols}
+                    dcol = lc.get("timestamp") or lc.get("date")
+                    ccol = lc.get("close"); ocol = lc.get("open")
+                    if dcol and ccol:
+                        s = pd.to_datetime(dfp[dcol], errors="coerce")
+                        st.write("Date range:", str(s.min()), "?", str(s.max()))
+                        st.success("Looks readable for scans.")
+                    else:
+                        st.error("Missing Date/Timestamp or Close column.")
+            except Exception as e:
+                st.error(f"Verify error: {e}")
 
 
 
-# Lightweight RSI helper placed before Scans so it is defined for visualizers
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    series = pd.to_numeric(series, errors='coerce')
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/float(length), adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/float(length), adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, np.nan))
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50.0).rename(f"RSI({length})")
-
-# ---------------- Scans ----------------
-if nav == 'Scans':
+# ---------------- Scans tab ----------------
+with tab4:
     st.subheader('Signal Scans')
     scan_type = st.selectbox('Mode', ['Single Ticker', 'All Tickers (latest)'], index=0)
     strategy = st.selectbox('Strategy', [
         'Gap >= |X| %',
         'Bollinger Squeeze Breakout',
         '52-week High Breakout',
-        'Earnings: Prior & Day-Of',
     ], index=0)
 
     if scan_type == 'Single Ticker':
@@ -784,12 +508,6 @@ if nav == 'Scans':
                         ev = pd.DataFrame()
                     else:
                         ev = _rs_52w_high(sdf, spy)
-                elif strategy.startswith('Earnings'):
-                    try:
-                        ev = _earnings_prior_dayof_scan(tkr_in, sdf)
-                    except Exception as e:
-                        st.error(f'Earnings scan failed: {e}')
-                        ev = pd.DataFrame()
                 else:
                     ev = _breakout_52w(sdf, int(look52))
                 st.caption(f'Events: {len(ev)}')
@@ -800,659 +518,28 @@ if nav == 'Scans':
                     st.dataframe(ev.tail(200), use_container_width=True)
                     csv = ev.to_csv(index=False).encode('utf-8')
                     st.download_button('Download CSV', data=csv, file_name=f'{tkr_in}_{strategy.replace(" ","_")}.csv', mime='text/csv')
-
-    st.markdown("---")
-    st.subheader("Return Visualizers")
-    vis = st.selectbox(
-        "Visualizer",
-        [
-            "Gap Off-Open Return",
-            "Prev Day Close-Close → Overnight",
-            "Intraday Time Move → Close",
-            "Earnings Long-Term Returns",
-            "RSI Backtest",
-        ],
-        index=0,
-        key="vis_kind",
-    )
-    tkr_vis = st.text_input("Ticker (or A/B for relative)", value=ticker).strip().upper()
-    colA, colB, colC = st.columns(3)
-    with colA:
-        consec_up = st.number_input("Consecutive up days (>=)", value=0, min_value=0, max_value=10, step=1)
-    with colB:
-        wd_names = ["Mon","Tue","Wed","Thu","Fri"]
-        wd_sel = st.multiselect("Weekdays", options=wd_names, default=wd_names)
-    with colC:
-        rsi_gate = st.number_input("RSI gate (pos = >=, neg = <=)", value=0, step=1)
-
-    def _weekday_mask(dti: pd.DatetimeIndex, wd_sel_list: list[str]) -> pd.Series:
-        wd_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri"}
-        return pd.Series([wd_map.get(int(x),"") in set(wd_sel_list) for x in dti.weekday], index=dti)
-
-    def _apply_common_filters(df_d: pd.DataFrame) -> pd.Series:
-        idx_ok = pd.Series(True, index=df_d.index)
-        if consec_up and consec_up > 0:
-            cc = df_d["Close"].pct_change()
-            streak = (cc > 0).astype(int)
-            ups = streak.rolling(consec_up, min_periods=consec_up).sum().shift(1)
-            idx_ok &= (ups >= consec_up)
-        if isinstance(df_d.index, pd.DatetimeIndex):
-            idx_ok &= _weekday_mask(df_d.index, wd_sel)
-        if rsi_gate != 0:
-            try:
-                rsi_len_local = int(st.session_state.get('vis_rsi_len', 14))
-            except Exception:
-                rsi_len_local = 14
-            rsiv = rsi(df_d["Close"].astype(float), int(rsi_len_local))
-            if rsi_gate > 0:
-                idx_ok &= (rsiv >= float(rsi_gate))
-            else:
-                idx_ok &= (rsiv <= abs(float(rsi_gate)))
-        return idx_ok.fillna(False)
-
-    # ---- Shared visual helpers ----
-    import re as _re
-    def _slug(s: str) -> str:
-        return _re.sub(r"[^a-zA-Z0-9_]", "_", str(s))
-
-    def _viz_hist_and_heatmap(series: pd.Series, title_prefix: str = ""):
-        try:
-            import plotly.graph_objects as _go
-        except Exception:
-            _go = None
-        _k = _slug(vis)
-        show_hist = st.checkbox("Show histogram", value=True, key=f"hist_{_k}")
-        show_heat = st.checkbox("Show month/weekday heatmap", value=False, key=f"heat_{_k}")
-        heat_metric = st.selectbox("Heatmap metric", ["Count", "Mean Return"], index=0, key=f"heat_metric_{_k}") if show_heat else None
-        if show_hist and _go is not None and len(series) > 0:
-            fig_h = _go.Figure(_go.Histogram(x=series.values, nbinsx=40, marker_color="#4e79a7"))
-            fig_h.update_layout(title=f"{title_prefix}Histogram", xaxis_title="Return %", yaxis_title="Freq")
-            st.plotly_chart(fig_h, use_container_width=True)
-        if show_heat and len(series) > 0:
-            idx = pd.to_datetime(series.index)
-            dfm = pd.DataFrame({"month": idx.month, "wday": idx.weekday, "ret": series.values})
-            if heat_metric == "Mean Return":
-                pivot = dfm.pivot_table(index="month", columns="wday", values="ret", aggfunc="mean")
-                z_title = "Mean %"
-            else:
-                pivot = dfm.pivot_table(index="month", columns="wday", values="ret", aggfunc="count")
-                z_title = "Count"
-            pivot = pivot.reindex(index=range(1,13), columns=range(0,5))
-            if _go is not None:
-                fig_ht = _go.Figure(data=_go.Heatmap(z=pivot.values, x=["Mon","Tue","Wed","Thu","Fri"], y=[str(m) for m in range(1,13)], colorscale="Blues"))
-                fig_ht.update_layout(title=f"{title_prefix}Month x Weekday ({z_title})", xaxis_title="Weekday", yaxis_title="Month")
-                st.plotly_chart(fig_ht, use_container_width=True)
-        return
-
-    def _viz_calendar_heatmap(series: pd.Series, title_prefix: str = ""):
-        try:
-            import plotly.graph_objects as _go
-        except Exception:
-            _go = None
-        if len(series) == 0:
-            return
-        idx = pd.to_datetime(series.index)
-        years = sorted(set(idx.year))
-        _k = _slug(vis)
-        show_cal = st.checkbox("Show calendar heatmap", value=False, key=f"cal_{_k}")
-        if not show_cal:
-            return
-        year = st.selectbox("Year", options=years, index=len(years)-1, key=f"cal_year_{_k}") if years else None
-        if year is None:
-            return
-        sel = series[idx.year == year]
-        if len(sel) == 0:
-            st.info("No occurrences for selected year.")
-            return
-        # Build day-of-month x month grid
-        idx2 = pd.to_datetime(sel.index)
-        dfm = pd.DataFrame({"dom": idx2.day, "mon": idx2.month, "ret": sel.values})
-        pv_count = dfm.pivot_table(index="dom", columns="mon", values="ret", aggfunc="count").reindex(index=range(1,32), columns=range(1,13))
-        pv_mean = dfm.pivot_table(index="dom", columns="mon", values="ret", aggfunc="mean").reindex(index=range(1,32), columns=range(1,13))
-        metric = st.selectbox("Calendar metric", ["Count", "Mean Return"], index=0, key=f"cal_metric_{_k}")
-        z = pv_count.values if metric == "Count" else pv_mean.values
-        z_title = "Count" if metric == "Count" else "Mean %"
-        if _go is not None:
-            fig_cal = _go.Figure(data=_go.Heatmap(z=z, x=[str(m) for m in range(1,13)], y=[str(d) for d in range(1,32)], colorscale="Viridis"))
-            fig_cal.update_layout(title=f"{title_prefix}Calendar {year} ({z_title})", xaxis_title="Month", yaxis_title="Day")
-            st.plotly_chart(fig_cal, use_container_width=True)
-
-    def _summary_table(d: pd.DataFrame, idx: pd.DatetimeIndex) -> pd.DataFrame:
-        if d is None or d.empty:
-            return pd.DataFrame()
-        g = d.sort_values("Date").set_index("Date") if "Date" in d.columns else d.copy()
-        g = g.loc[g.index.intersection(pd.to_datetime(idx))]
-        prevc = g["Close"].shift(1)
-        out = pd.DataFrame(index=g.index)
-        out["Prev Close to Close"] = (g["Close"] / prevc - 1.0) * 100.0
-        out["Close to Open"] = (g["Open"] / prevc - 1.0) * 100.0
-        out["Open to Close"] = (g["Close"] / g["Open"] - 1.0) * 100.0
-        for H in (1,3,5,10):
-            out[f"{H} Day Return"] = (g["Close"].shift(-H) / g["Close"] - 1.0) * 100.0
-        # All-time high flags and N-day high number (days into history when ATH)
-        cummax = g["Close"].cummax()
-        out["All Time High"] = g["Close"] >= cummax
-        out["# Day High"] = np.where(out["All Time High"], np.arange(1, len(g)+1), np.nan)
-        # Consecutive up/down count with sign
-        cc = g["Close"].diff()
-        sgn = np.sign(cc.fillna(0))
-        grp = (sgn != sgn.shift(1)).cumsum()
-        streak = sgn.groupby(grp).cumsum()
-        out["Consecutive Up/Down"] = streak
-        return out.dropna(how="all")
-
-    def _viz_price_marks(daily_df: pd.DataFrame, dates_idx: pd.DatetimeIndex, title: str):
-        try:
-            from plotly.subplots import make_subplots as _mk
-            import plotly.graph_objects as _go
-        except Exception:
-            st.info("plotly unavailable for price visualization.")
-            return
-        if daily_df is None or daily_df.empty:
-            st.info("Daily data unavailable for price visualization.")
-            return
-        d = daily_df.sort_values("Date").set_index("Date") if "Date" in daily_df.columns else daily_df.copy()
-        figp = _mk(rows=1, cols=1)
-        figp.add_trace(_go.Candlestick(x=d.index, open=d.get("Open"), high=d.get("High"), low=d.get("Low"), close=d.get("Close"), name="OHLC"))
-        for dt in pd.to_datetime(dates_idx):
-            try:
-                figp.add_vrect(x0=dt, x1=dt + pd.Timedelta(days=1), fillcolor="rgba(255,0,0,0.08)", line_width=0)
-            except Exception:
-                pass
-        figp.update_layout(title=title, xaxis_rangeslider_visible=False)
-        st.plotly_chart(figp, use_container_width=True)
-
-    if vis == "Gap Off-Open Return":
-        c1, c2 = st.columns(2)
-        with c1:
-            gap_thr = st.number_input("Gap threshold % (sign for dir)", value=3.0, step=0.5)
-        with c2:
-            lookback_days = st.number_input("Lookback days", value=365, min_value=30, max_value=5000, step=30)
-        run = st.button("Run Gap Off-Open", key="run_gap_offopen")
-        if run:
-            df_d = _load_daily_df(tkr_vis)
-            if df_d is None or df_d.empty or not set(["Open","Close"]).issubset(df_d.columns):
-                st.warning("Daily data unavailable or missing Open/Close.")
-            else:
-                df_d = df_d.sort_values("Date").set_index("Date")
-                df_d = df_d.last(f"{int(lookback_days)}D") if isinstance(df_d.index, pd.DatetimeIndex) else df_d.tail(int(lookback_days))
-                prevc = df_d["Close"].shift(1)
-                gap_pct = (df_d["Open"] / prevc - 1.0) * 100.0
-                mask_gap = (np.sign(gap_thr) * gap_pct >= abs(gap_thr))
-                mask = mask_gap & _apply_common_filters(df_d)
-                sel = df_d[mask]
-                day_ret = (sel["Close"] / sel["Open"] - 1.0) * 100.0
-                st.caption(f"Signals: {len(day_ret)} | Mean off-open %: {day_ret.mean():.2f} | Median: {day_ret.median():.2f}")
-                if len(day_ret) > 0:
-                    eq = (1.0 + (day_ret.fillna(0)/100.0)).cumprod()
-                    st.line_chart(eq.rename("Equity (Off-Open)"))
-                    tbl = _summary_table(_load_daily_df(tkr_vis), day_ret.index)
-                    if not tbl.empty:
-                        try:
-                            styled = tbl.style.applymap(lambda v: "background-color:#2ecc40;color:#000" if (isinstance(v,(int,float)) and v>=0) else ("background-color:#ff6961;color:#000" if isinstance(v,(int,float)) else ""), subset=[c for c in tbl.columns if c.endswith("Return") or c in ("Prev Close to Close","Close to Open","Open to Close")])
-                            st.write(styled)
-                        except Exception:
-                            st.dataframe(tbl, use_container_width=True)
-                    # CSV export
-                    try:
-                        prevc_sel = prevc.reindex(day_ret.index)
-                        gap_sel = (sel["Open"] / prevc_sel - 1.0) * 100.0
-                        df_out = pd.DataFrame({"Date": pd.to_datetime(day_ret.index), "Gap_%": gap_sel.values, "OffOpen_%": day_ret.values}).set_index("Date")
-                        st.download_button("Download CSV (occurrences)", data=df_out.to_csv(), file_name=f"{tkr_vis}_gap_offopen.csv", mime="text/csv")
-                    except Exception:
-                        pass
-                    show_marks = st.checkbox("Show price chart with occurrences", value=False, key="marks_gap_offopen")
-                    send_marks = st.checkbox("Send these dates to Chart highlights", value=False, key="send_gap_offopen")
-                    if show_marks:
-                        _viz_price_marks(_load_daily_df(tkr_vis), day_ret.index, f"{tkr_vis}: Gap Off-Open occurrences")
-                    if send_marks:
-                        try:
-                            st.session_state['scan_highlights'] = [str(pd.to_datetime(x).date()) for x in day_ret.index]
-                            st.success("Dates sent to Chart tab (toggle 'Show scan highlights').")
-                        except Exception:
-                            pass
-
-    if vis == "Prev Day Close-Close → Overnight":
-        c1, c2 = st.columns(2)
-        with c1:
-            cc_thr = st.number_input("Prev close-close % (|x|)", value=2.0, step=0.5)
-        with c2:
-            relative = "/" in tkr_vis
-        run = st.button("Run Prev CC → Overnight", key="run_prevcc_ov")
-        if run:
-            base_sym, rel_sym = (tkr_vis.split("/",1) + [""])[:2]
-            df_d = _load_daily_df(base_sym)
-            if df_d is None or df_d.empty:
-                st.warning("Daily data unavailable for base.")
-            else:
-                d = df_d.sort_values("Date").set_index("Date")
-                cc = (d["Close"] / d["Close"].shift(1) - 1.0) * 100.0
-                sel_mask = (cc.abs() >= abs(cc_thr)) & _apply_common_filters(d)
-                next_open = d["Open"].shift(-1)
-                ov = (next_open / d["Close"] - 1.0) * 100.0
-                ret = ov[sel_mask]
-                if relative and rel_sym:
-                    d2 = _load_daily_df(rel_sym)
-                    if d2 is not None and not d2.empty:
-                        d2 = d2.sort_values("Date").set_index("Date")
-                        ov2 = (d2["Open"].shift(-1) / d2["Close"] - 1.0) * 100.0
-                        ret = (ret - ov2.reindex(ret.index))
-                st.caption(f"Signals: {len(ret)} | Mean overnight %: {ret.mean():.2f} | Median: {ret.median():.2f}")
-                if len(ret) > 0:
-                    eq = (1.0 + (ret.fillna(0)/100.0)).cumprod()
-                    st.line_chart(eq.rename("Equity (Overnight)"))
-                    tbl = _summary_table(_load_daily_df(base_sym), ret.index)
-                    if not tbl.empty:
-                        try:
-                            styled = tbl.style.applymap(lambda v: "background-color:#2ecc40;color:#000" if (isinstance(v,(int,float)) and v>=0) else ("background-color:#ff6961;color:#000" if isinstance(v,(int,float)) else ""), subset=[c for c in tbl.columns if c.endswith("Return") or c in ("Prev Close to Close","Close to Open","Open to Close")])
-                            st.write(styled)
-                        except Exception:
-                            st.dataframe(tbl, use_container_width=True)
-                    # CSV export
-                    try:
-                        df_out = pd.DataFrame({"Date": pd.to_datetime(ret.index), "Overnight_%": ret.values}).set_index("Date")
-                        st.download_button("Download CSV (occurrences)", data=df_out.to_csv(), file_name=f"{base_sym}_prevcc_overnight.csv", mime="text/csv")
-                    except Exception:
-                        pass
-                    show_marks = st.checkbox("Show price chart with occurrences", value=False, key="marks_prevcc_ov")
-                    send_marks = st.checkbox("Send these dates to Chart highlights", value=False, key="send_prevcc_ov")
-                    if show_marks:
-                        _viz_price_marks(_load_daily_df(base_sym), ret.index, f"{base_sym}: Prev CC → Overnight occurrences")
-                    if send_marks:
-                        try:
-                            st.session_state['scan_highlights'] = [str(pd.to_datetime(x).date()) for x in ret.index]
-                            st.success("Dates sent to Chart tab (toggle 'Show scan highlights').")
-                        except Exception:
-                            pass
-
-    if vis == "Intraday Time Move → Close":
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            hhmm = st.text_input("Time of day (HH:MM, NY)", value="10:30")
-        with c2:
-            move_thr = st.number_input("Move from open % (sign)", value=2.0, step=0.5)
-        with c3:
-            intr_period = st.selectbox("Intraday period", ["5d","7d","14d","30d","60d"], index=2)
-        run = st.button("Run Intraday Visualizer", key="run_intra_time")
-        if run:
-            df_intra = fetch_ohlc_with_fallback(tkr_vis, interval="5m", period=intr_period)
-            if df_intra is None or df_intra.empty or not isinstance(df_intra.index, pd.DatetimeIndex):
-                st.warning("Intraday data unavailable.")
-            else:
-                df = normalize_ohlcv(df_intra)
-                try:
-                    idx_ny = df.index.tz_convert('America/New_York') if df.index.tz is not None else df.index.tz_localize('UTC').tz_convert('America/New_York')
-                except Exception:
-                    idx_ny = df.index
-                df = df.copy(); df.index = idx_ny
-                days = sorted(set(df.index.date))
-                target_returns = []
-                for day in days:
-                    day_df = df[str(day)]
-                    if day_df.empty:
-                        continue
-                    o = float(day_df["Open"].iloc[0])
-                    try:
-                        hh, mm = [int(x) for x in str(hhmm).split(":",1)]
-                        ts = pd.Timestamp(year=day.year, month=day.month, day=day.day, hour=hh, minute=mm, tz='America/New_York')
-                        pos = day_df.index.get_indexer([ts], method='nearest')
-                        i = int(pos[0]) if pos.size and pos[0] != -1 else None
-                    except Exception:
-                        i = None
-                    if i is None:
-                        continue
-                    px_t = float(day_df["Close"].iloc[i])
-                    move = (px_t / o - 1.0) * 100.0
-                    if np.sign(move_thr) * move >= abs(move_thr):
-                        c = float(day_df["Close"].iloc[-1])
-                        r = (c / px_t - 1.0) * 100.0
-                        target_returns.append(r)
-                s = pd.Series(target_returns)
-                st.caption(f"Signals: {len(s)} | Mean % to close: {s.mean():.2f} | Median: {s.median():.2f}")
-                if len(s) > 0:
-                    st.line_chart((1.0 + (s.fillna(0)/100.0)).cumprod().rename("Equity (time→close)"))
-                    # Map returns to the actual matching dates we selected
-                    try:
-                        idx_series = pd.to_datetime([d for d in days if True][:len(s)])
-                        s_tm = pd.Series(s.values, index=idx_series)
-                    except Exception:
-                        s_tm = s
-                    # hist/heatmap hidden for now
-                    tbl = _summary_table(_load_daily_df(tkr_vis), s_tm.index)
-                    if not tbl.empty:
-                        try:
-                            styled = tbl.style.applymap(lambda v: "background-color:#2ecc40;color:#000" if (isinstance(v,(int,float)) and v>=0) else ("background-color:#ff6961;color:#000" if isinstance(v,(int,float)) else ""), subset=[c for c in tbl.columns if c.endswith("Return") or c in ("Prev Close to Close","Close to Open","Open to Close")])
-                            st.write(styled)
-                        except Exception:
-                            st.dataframe(tbl, use_container_width=True)
-                    # CSV export
-                    try:
-                        df_out = pd.DataFrame({"Date": pd.to_datetime(s_tm.index), "%_time_to_close": s_tm.values}).set_index("Date")
-                        st.download_button("Download CSV (occurrences)", data=df_out.to_csv(), file_name=f"{tkr_vis}_intraday_time_close.csv", mime="text/csv")
-                    except Exception:
-                        pass
-                    show_marks = st.checkbox("Show price chart with occurrences", value=False, key="marks_intraday_time")
-                    send_marks = st.checkbox("Send these dates to Chart highlights", value=False, key="send_intraday_time")
-                    if show_marks:
-                        # occurrences are the subset of days that met threshold; approximate by last len(s) days that passed
-                        _viz_price_marks(_load_daily_df(tkr_vis), s_tm.index, f"{tkr_vis}: Intraday time→close occurrences")
-                    if send_marks:
-                        try:
-                            st.session_state['scan_highlights'] = [str(pd.to_datetime(d).date()) for d in s_tm.index]
-                            st.success("Dates sent to Chart tab (toggle 'Show scan highlights').")
-                        except Exception:
-                            pass
-
-    if vis == "Earnings Long-Term Returns":
-        c1, c2 = st.columns(2)
-        with c1:
-            move_type = st.selectbox("Move filter", ["Gap %", "Day %", "Close→Close %"], index=0)
-        with c2:
-            move_thr = st.number_input("Move threshold % (|x|)", value=3.0, step=0.5)
-        horizon = st.select_slider("Horizon (days)", options=[5,10,21,42,63], value=63)
-        run = st.button("Run Earnings LT", key="run_earn_lt")
-        if run:
-            df_d = _load_daily_df(tkr_vis)
-            if df_d is None or df_d.empty:
-                st.warning("Daily data unavailable.")
-            else:
-                d = df_d.sort_values("Date").set_index("Date")
-                eds = _get_earnings_dates_yf(tkr_vis)
-                if not eds:
-                    st.warning("No earnings dates from yfinance.")
-                else:
-                    ed_idx = [pd.to_datetime(x) for x in eds]
-                    prevc = d["Close"].shift(1)
-                    gap = (d["Open"] / prevc - 1.0) * 100.0
-                    dayp = (d["Close"] / d["Open"] - 1.0) * 100.0
-                    cc = (d["Close"] / d["Close"].shift(1) - 1.0) * 100.0
-                    m = gap if move_type.startswith("Gap") else (dayp if move_type.startswith("Day") else cc)
-                    sig = (m.abs() >= abs(move_thr)) & d.index.isin(ed_idx) & _apply_common_filters(d)
-                    rows = []
-                    for ts in d.index[sig]:
-                        end_ix = d.index.get_indexer([ts + pd.Timedelta(days=int(horizon))], method='nearest')
-                        j = int(end_ix[0]) if end_ix.size and end_ix[0] != -1 else None
-                        if j is None:
-                            continue
-                        start_px = float(d.loc[ts, "Close"]) 
-                        end_px = float(d.iloc[j]["Close"])   
-                        fr = (end_px / start_px - 1.0) * 100.0
-                        rows.append(fr)
-                    s = pd.Series(rows)
-                    st.caption(f"Signals: {len(s)} | Mean % (close→close {horizon}d): {s.mean():.2f}")
-                    if len(s) > 0:
-                        st.line_chart((1.0 + (s.fillna(0)/100.0)).cumprod().rename(f"Equity ({horizon}d)"))
-                        tbl = _summary_table(_load_daily_df(tkr_vis), s.index)
-                        if not tbl.empty:
-                            try:
-                                styled = tbl.style.applymap(lambda v: "background-color:#2ecc40;color:#000" if (isinstance(v,(int,float)) and v>=0) else ("background-color:#ff6961;color:#000" if isinstance(v,(int,float)) else ""), subset=[c for c in tbl.columns if c.endswith("Return") or c in ("Prev Close to Close","Close to Open","Open to Close")])
-                                st.write(styled)
-                            except Exception:
-                                st.dataframe(tbl, use_container_width=True)
-                        # CSV export
-                        try:
-                            df_out = pd.DataFrame({"Date": pd.to_datetime(s.index), f"{horizon}d_%": s.values}).set_index("Date")
-                            st.download_button("Download CSV (occurrences)", data=df_out.to_csv(), file_name=f"{tkr_vis}_earnings_{horizon}d.csv", mime="text/csv")
-                        except Exception:
-                            pass
-                        show_marks = st.checkbox("Show price chart with occurrences", value=False, key=f"marks_earn_{horizon}")
-                        send_marks = st.checkbox("Send these dates to Chart highlights", value=False, key=f"send_earn_{horizon}")
-                        if show_marks:
-                            _viz_price_marks(_load_daily_df(tkr_vis), s.index, f"{tkr_vis}: Earnings LT occurrences ({horizon}d)")
-                        if send_marks:
-                            try:
-                                st.session_state['scan_highlights'] = [str(pd.to_datetime(x).date()) for x in s.index]
-                                st.success("Dates sent to Chart tab (toggle 'Show scan highlights').")
-                            except Exception:
-                                pass
-
-    if vis == "RSI Backtest":
-        thr = st.number_input("RSI threshold (pos ≥, neg ≤)", value=30, step=1, key='rsi_bt_thr')
-        rsi_len_days = st.number_input("RSI length (days)", value=14, min_value=2, max_value=250, step=1, key='rsi_bt_len')
-        try:
-            st.session_state['vis_rsi_len'] = int(rsi_len_days)
-        except Exception:
-            pass
-        horizons = st.multiselect("Horizons (days)", options=[1,5,10,21,42,63], default=[1,5,21])
-        run = st.button("Run RSI Backtest", key="run_rsi_bt")
-        if run:
-            df_d = _load_daily_df(tkr_vis)
-            if df_d is None or df_d.empty:
-                st.warning("Daily data unavailable.")
-            else:
-                d = df_d.sort_values("Date").set_index("Date")
-                rsiv = rsi(d["Close"].astype(float), int(rsi_len_days))
-                sig = (rsiv >= float(thr)) if thr >= 0 else (rsiv <= abs(float(thr)))
-                sig &= _apply_common_filters(d)
-                stats = []
-                for H in horizons:
-                    rets = []
-                    for ts in d.index[sig]:
-                        end_ix = d.index.get_indexer([ts + pd.Timedelta(days=int(H))], method='nearest')
-                        j = int(end_ix[0]) if end_ix.size and end_ix[0] != -1 else None
-                        if j is None:
-                            continue
-                        r = (float(d.iloc[j]["Close"]) / float(d.loc[ts, "Close"]) - 1.0) * 100.0
-                        rets.append(r)
-                    s = pd.Series(rets)
-                    stats.append((H, s.mean(), s.median(), len(s)))
-                    st.caption(f"H={H}d | signals={len(s)} | mean={s.mean():.2f} | median={s.median():.2f}")
-                if stats:
-                    df_stats = pd.DataFrame(stats, columns=["H","Mean%","Median%","N"]).set_index("H")
-                    st.dataframe(df_stats, use_container_width=True)
-
-# ---------------- Overnight ----------------
-if nav == 'Overnight':
-    st.subheader('Pct Chg Overnight')
-    c1, c2, c3 = st.columns([2,1,1])
-    with c1:
-        tkr_ov = st.text_input('Ticker', value=st.session_state.get('ticker','AAPL')).strip().upper()
-    with c2:
-        strategy_ov = st.selectbox(
-            'Strategy',
-            ['ATR change', 'Gap', 'Close-to-Close'],
-            index=0,
-            key='ov_strategy'
-        )
-    with c3:
-        lastn = st.number_input('Last N signals (table)', value=20, min_value=5, max_value=200, step=5, key='ov_lastn')
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        thr = st.number_input('Threshold (%)', value=0.50 if strategy_ov.startswith('ATR') else 3.0, step=0.1, key='ov_threshold')
-    with c5:
-        # Allow ATR parameters even when strategy is Gap (as optional filter)
-        atr_n = st.number_input('ATR lookback', value=14, min_value=5, max_value=60, step=1, key='ov_atr_n')
-    with c6:
-        run_ov = st.button('Run Overnight Backtest', key='ov_run')
-
-    # ATR options (can be used as primary strategy or as an additional filter when strategy != 'ATR change')
-    col_a, col_b = st.columns(2)
-    with col_a:
-        is_atr = ('ATR' in str(strategy_ov).upper())
-        if is_atr:
-            atr_change_type = st.selectbox(
-                'ATR change type',
-                options=['Absolute', 'Increase only', 'Decrease only'],
-                index=0,
-                key='ov_atr_change_type'
-            )
-            atr_thr = float(thr)
-            use_atr_filter = False
-        else:
-            use_atr_filter = st.checkbox('Add ATR change filter', value=False, key='ov_use_atr_filter')
-            atr_change_type = st.selectbox(
-                'ATR change type',
-                options=['Absolute', 'Increase only', 'Decrease only'],
-                index=0,
-                disabled=not use_atr_filter,
-                key='ov_atr_change_type'
-            )
-            atr_thr = st.number_input('ATR change threshold (%)', value=0.50, step=0.1, disabled=not use_atr_filter, key='ov_atr_threshold')
-    with col_b:
-        exit_at = st.selectbox('Exit at', options=['Next Open', 'Next Close', 'Both'], index=0, key='ov_exit_at')
-
-    if run_ov:
-        df_d = _load_daily_df(tkr_ov)
-        if df_d is None or df_d.empty:
-            st.error('No daily data found for ticker from Parquet/providers.')
-        elif not set(['Date','Open','Close']).issubset(set(df_d.columns)):
-            st.error('Daily data missing Open/Close columns.')
-        else:
-            try:
-                df_d = df_d.sort_values('Date').reset_index(drop=True)
-                # Build primary signal
-                sig_primary = _build_signal_mask(df_d, strategy_ov, float(thr), int(atr_n), atr_change_type if strategy_ov.startswith('ATR') else None)
-                sig = sig_primary
-                # Optional ATR filter in addition to Gap/Close-to-Close
-                if (not strategy_ov.startswith('ATR')) and bool(use_atr_filter):
-                    sig_atr = _build_signal_mask(df_d, 'ATR change', float(atr_thr), int(atr_n), atr_change_type)
-                    sig = (sig_primary & sig_atr)
-                ev, eq_ov, eq_day = _overnight_results(df_d, sig)
-
-                # Layout: chart left, last-N table right
-                lcol, rcol = st.columns([3,1])
-                with lcol:
-                    from plotly.subplots import make_subplots as _mk
-                    import plotly.graph_objects as _go
-                    fig = _mk(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.55,0.45])
-                    # Add equity curves
-                    fig.add_trace(_go.Scatter(x=df_d['Date'], y=eq_ov.values, mode='lines', name='Equity (Next Open)'), row=1, col=1)
-                    fig.add_trace(_go.Scatter(x=df_d['Date'], y=eq_day.values, mode='lines', name='Equity (Close)'), row=2, col=1)
-                    # Shade signal dates
-                    sd = df_d.loc[sig, 'Date']
-                    for d in sd:
-                        try:
-                            fig.add_vrect(x0=d, x1=d + pd.Timedelta(days=1), fillcolor='rgba(255,0,0,0.08)', line_width=0, row='all', col=1)
-                        except Exception:
-                            pass
-                    try:
-                        _tpl = template  # from apply_theme(theme)
-                    except Exception:
-                        _tpl = 'plotly'
-                    title_extra = ''
-                    if strategy_ov.startswith('ATR') and atr_change_type:
-                        title_extra = f" ({atr_change_type})"
-                    if (not strategy_ov.startswith('ATR')) and bool(use_atr_filter):
-                        title_extra = f" + ATR {atr_change_type}"
-                    fig.update_layout(height=700, title=f"{tkr_ov}: {strategy_ov}{title_extra}", xaxis_rangeslider_visible=False, template=_tpl)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                with rcol:
-                    try:
-                        st.caption('Last signals')
-                        st.dataframe(ev.tail(int(lastn))[['Date','Overnight_%','Day_%']].rename(columns={'Overnight_%':'Next Open %','Day_%':'Same Day %'}), use_container_width=True)
-                    except Exception:
-                        pass
-
-                # Trade log + KPIs
-                st.markdown('**Trade Log**')
-                log = ev.copy()
-                log['NextOpen'] = df_d['Open'].shift(-1).loc[log.index]
-                st.dataframe(log.tail(200), use_container_width=True)
-                # Export buttons
-                try:
-                    cex1, cex2, cex3 = st.columns(3)
-                    with cex1:
-                        csv_log = log.to_csv(index=False).encode('utf-8')
-                        st.download_button('Download Trade Log CSV', data=csv_log, file_name=f'{tkr_ov}_overnight_trades.csv', mime='text/csv')
-                    with cex2:
-                        eqdf = pd.DataFrame({'Date': df_d['Date'], 'Equity_OV': eq_ov.values, 'Equity_DAY': eq_day.values})
-                        csv_eq = eqdf.to_csv(index=False).encode('utf-8')
-                        st.download_button('Download Equity CSV', data=csv_eq, file_name=f'{tkr_ov}_overnight_equity.csv', mime='text/csv')
-                    with cex3:
-                        last_tbl = ev.tail(int(lastn))[['Date','Overnight_%','Day_%']].rename(columns={'Overnight_%':'Next Open %','Day_%':'Same Day %'})
-                        csv_last = last_tbl.to_csv(index=False).encode('utf-8')
-                        st.download_button('Download Last-N CSV', data=csv_last, file_name=f'{tkr_ov}_overnight_last{int(lastn)}.csv', mime='text/csv')
-                except Exception:
-                    pass
-                k1, k2, k3, k4 = st.columns(4)
-                with k1:
-                    st.metric('Trades', f"{len(ev):,}")
-                with k2:
-                    try:
-                        if exit_at == 'Next Close':
-                            wr = float((ev['Day_%'] > 0).mean() * 100.0)
-                            st.metric('Win rate (Next Close)', f"{wr:.1f}%")
-                        elif exit_at == 'Both':
-                            wr_o = float((ev['Overnight_%'] > 0).mean() * 100.0)
-                            wr_c = float((ev['Day_%'] > 0).mean() * 100.0)
-                            st.metric('Win rate (Open/Close)', f"{wr_o:.1f}% / {wr_c:.1f}%")
-                        else:
-                            wr = float((ev['Overnight_%'] > 0).mean() * 100.0)
-                            st.metric('Win rate (Next Open)', f"{wr:.1f}%")
-                    except Exception:
-                        st.metric('Win rate', '-')
-                with k3:
-                    try:
-                        if exit_at == 'Next Close':
-                            avg_c = float(ev['Day_%'].mean())
-                            st.metric('Avg Next Close %', f"{avg_c:.2f}%")
-                        elif exit_at == 'Both':
-                            avg_o = float(ev['Overnight_%'].mean())
-                            avg_c = float(ev['Day_%'].mean())
-                            st.metric('Avg Open/Close %', f"{avg_o:.2f}% / {avg_c:.2f}%")
-                        else:
-                            avg_o = float(ev['Overnight_%'].mean())
-                            st.metric('Avg Next Open %', f"{avg_o:.2f}%")
-                    except Exception:
-                        st.metric('Average %', '-')
-                with k4:
-                    try:
-                        if exit_at == 'Next Close':
-                            pnl = (eq_day.dropna().iloc[-1] - 1.0) * 100.0
-                            st.metric('Total P&L (Next Close)', f"{pnl:.2f}%")
-                        elif exit_at == 'Both':
-                            pnl_o = (eq_ov.dropna().iloc[-1] - 1.0) * 100.0
-                            pnl_c = (eq_day.dropna().iloc[-1] - 1.0) * 100.0
-                            st.metric('Total P&L (Open/Close)', f"{pnl_o:.2f}% / {pnl_c:.2f}%")
-                        else:
-                            pnl = (eq_ov.dropna().iloc[-1] - 1.0) * 100.0
-                            st.metric('Total P&L (Next Open)', f"{pnl:.2f}%")
-                    except Exception:
-                        st.metric('Total P&L', '-')
-            except Exception as e:
-                st.error(f'Overnight backtest error: {e}')
-# ---------------- Chart controls ----------------
+# ---------------- Chart tab controls ----------------
 with st.sidebar:
-    with st.expander("Overlays", expanded=False):
-        bb_on = st.checkbox("Bollinger Bands", value=False)
-        bb_len = st.number_input("BB Length", value=20, min_value=5, max_value=200, step=1, disabled=not bb_on)
-        bb_std = st.number_input("BB Std Dev", value=2.0, min_value=0.5, max_value=4.0, step=0.5, disabled=not bb_on)
-        st.markdown("")
-        st.markdown("Support/Resistance")
-        show_sr = st.checkbox("Enable Support/Resistance", value=False)
-        sr_lookback = st.number_input("SR Lookback (bars)", value=50, min_value=5, max_value=500, step=5, disabled=not show_sr)
-        st.markdown("")
-        show_patterns = st.checkbox("Candlestick Patterns", value=False)
-        st.markdown("")
-        show_vwap = st.checkbox("Anchored VWAP", value=False)
-        vwap_anchor = None
-        if show_vwap:
-            if intraday:
-                vwap_anchor = st.text_input("VWAP Anchor (YYYY-MM-DD HH:MM)", value="")
-            else:
-                vwap_anchor = st.date_input("VWAP Anchor Date", value=start)
+    st.markdown("### Overlays")
+    bb_on = st.checkbox("Bollinger Bands", value=True)
+    bb_len = st.number_input("BB Length", value=20, min_value=5, max_value=200, step=1)
+    bb_std = st.number_input("BB Std Dev", value=2.0, min_value=0.5, max_value=4.0, step=0.5)
 
-    with st.expander("Moving Averages", expanded=True):
+    st.markdown("### Moving Averages")
+    with st.expander("SMA / EMA", expanded=True):
         ma_periods = [10, 21, 50, 100, 150, 200]
         col_sma, col_ema = st.columns(2)
         with col_sma:
             st.write("**SMA**")
-            sma_selected = [p for p in ma_periods if st.checkbox(f"SMA {p}", value=(p in [10, 50, 200]), key=f"sma_{p}")]
+            sma_selected = [p for p in ma_periods if st.checkbox(f"SMA {p}", value=(p in [21, 50, 200]), key=f"sma_{p}")]
         with col_ema:
             st.write("**EMA**")
-            ema_selected = [p for p in ma_periods if st.checkbox(f"EMA {p}", value=False, key=f"ema_{p}")]
-
-    append_today_daily = st.checkbox("Append today's daily from intraday (if 1d)", value=(interval == "1d"))
+            ema_selected = [p for p in ma_periods if st.checkbox(f"EMA {p}", value=(p in [21, 50]), key=f"ema_{p}")]
 
     st.markdown("### Lower Panels")
-    lower_options = ["Volume", "Dollar Value Traded", "RSI", "Stochastic %K/%D", "MACD (panel)"]
+    lower_options = ["Volume", "RSI", "Stochastic %K/%D", "MACD (panel)"]
     lower_selected = st.multiselect("Add panels", options=lower_options, default=["Volume", "RSI"])
     show_volume = "Volume" in lower_selected
-    show_turnover = "Dollar Value Traded" in lower_selected
-    # Turnover (Dollar Value) smoothing options
-    show_turnover_ma = st.checkbox("Show $ Value 30d MA", value=True, disabled=not show_turnover)
-    turnover_ma_len = st.number_input("$ Value MA length (days)", value=30, min_value=5, max_value=250, step=5, disabled=not show_turnover)
     show_rsi = "RSI" in lower_selected
     rsi_len  = st.number_input("RSI Length", value=14, min_value=2, max_value=200, step=1, disabled=not show_rsi)
     show_sto = "Stochastic %K/%D" in lower_selected
@@ -1466,32 +553,26 @@ with st.sidebar:
     macd_slow = st.number_input("MACD Slow EMA", value=26, min_value=2, max_value=100, step=1)
     macd_signal = st.number_input("MACD Signal EMA", value=9, min_value=1, max_value=50, step=1)
 
-    # (Support/Resistance, Patterns, Anchored VWAP moved into Overlays expander above)
+    st.markdown("### Support/Resistance")
+    show_sr = st.checkbox("Support/Resistance", value=False)
+    sr_lookback = st.number_input("SR Lookback (bars)", value=50, min_value=5, max_value=500, step=5)
+
+    st.markdown("### Candlestick Patterns")
+    show_patterns = st.checkbox("Candlestick Patterns", value=False)
+
+    st.markdown("### Anchored VWAP")
+    show_vwap = st.checkbox("Anchored VWAP", value=False)
+    vwap_anchor = None
+    if show_vwap:
+        if intraday:
+            vwap_anchor = st.text_input("VWAP Anchor (YYYY-MM-DD HH:MM)", value="")
+        else:
+            vwap_anchor = st.date_input("VWAP Anchor Date", value=start)
 
     st.markdown("### Chart Layout")
     base_height = st.slider("Chart height (px)", 600, 1600, 1050, 50)
 
     show_price_labels = st.checkbox("Show price labels (right)", value=False)
-
-    # For daily interval, optionally show only the latest day (single bar)
-    show_only_latest_day = st.checkbox(
-        "Show only latest day (1d)",
-        value=(interval == "1d"),
-        help="When interval = 1d, limit the chart to just the most recent daily bar."
-    )
-
-    hide_overnight = st.checkbox("Hide overnight (intraday)", value=True)
-
-    minimalist_mode = st.checkbox("Minimalist theme (cleaner grid/ticks)", value=True)
-    thin_candles = st.checkbox("Candles: thin wicks, no fill", value=False)
-
-    show_scan_marks = st.checkbox("Show scan highlights (from Scans)", value=True)
-    if st.button("Clear highlights"):
-        try:
-            st.session_state['scan_highlights'] = []
-            st.success("Cleared scan highlights.")
-        except Exception:
-            pass
 
     force_fresh = st.checkbox("Force fresh fetch (bypass cache)", value=False)
     try:
@@ -1504,24 +585,6 @@ with st.sidebar:
     if polygon_key_input:
         st.session_state['polygon_api_key'] = polygon_key_input.strip()
 
-    with st.expander("Alpaca API (optional)"):
-        alp_key_id = st.text_input("Alpaca Key ID", value="", type="password")
-        alp_secret = st.text_input("Alpaca Secret", value="", type="password")
-        alp_data_url = st.text_input("Alpaca Data Base URL", value=os.getenv('APCA_API_DATA_URL') or 'https://data.alpaca.markets')
-        if alp_key_id:
-            st.session_state['alpaca_key_id'] = alp_key_id.strip()
-        if alp_secret:
-            st.session_state['alpaca_secret_key'] = alp_secret.strip()
-        if alp_data_url:
-            st.session_state['alpaca_data_url'] = alp_data_url.strip()
-
-    with st.expander("Tradier API (optional)"):
-        tradier_token = st.text_input("Tradier OAuth Token", value=os.getenv('TRADIER_TOKEN') or "", type="password")
-        tradier_sandbox = st.checkbox("Use Sandbox", value=bool(os.getenv('TRADIER_SANDBOX', "").strip() not in ("", "0", "false", "False")))
-        if tradier_token:
-            st.session_state['tradier_token'] = tradier_token.strip()
-        st.session_state['tradier_sandbox'] = bool(tradier_sandbox)
-
     # Diagnostics (key detection + last source)
     try:
         _poly_key = st.session_state.get('polygon_api_key')
@@ -1533,51 +596,9 @@ with st.sidebar:
                 pass
         if not _poly_key:
             _poly_key = os.getenv('POLYGON_API_KEY')
-
-        # Alpaca detection (UI/secrets/env)
-        _alp_key = None
-        try:
-            _alp_key = st.session_state.get('alpaca_key_id') or _alp_key
-        except Exception:
-            pass
-        try:
-            if hasattr(st, 'secrets'):
-                _alp_key = st.secrets.get('ALPACA_API_KEY_ID') or st.secrets.get('APCA_API_KEY_ID')
-        except Exception:
-            pass
-        if not _alp_key:
-            _alp_key = os.getenv('ALPACA_API_KEY_ID') or os.getenv('APCA_API_KEY_ID') or os.getenv('ALPACA_API_KEY')
-
         _last_src = st.session_state.get('last_fetch_provider', '-')
         st.markdown("### Diagnostics")
-        st.caption(f"Polygon key detected: {bool(_poly_key)} | Alpaca key detected: {bool(_alp_key)} | Last source: {_last_src}")
-    except Exception:
-        pass
-
-    # Live updates for intraday
-    st.markdown("### Live Data")
-    live_on = st.checkbox("Live updates (intraday)", value=False)
-    refresh_secs = st.number_input("Refresh every (seconds)", value=15, min_value=5, max_value=300, step=5, disabled=not live_on)
-    try:
-        # When live is on, always force fresh fetches
-        if live_on:
-            st.session_state['force_refresh'] = True
-            if intraday:
-                # Simple meta refresh to update the page
-                st.markdown(f"<meta http-equiv='refresh' content='{int(refresh_secs)}'>", unsafe_allow_html=True)
-    except Exception:
-        pass
-
-    # Data Provider preference
-    st.markdown("### Data Provider")
-    try:
-        pref = st.selectbox(
-            "Preferred provider",
-            ["Auto (best available)", "Polygon", "Alpaca", "Tiingo"],
-            index=0,
-            help="Try this provider first when fetching chart data."
-        )
-        st.session_state['preferred_provider'] = pref
+        st.caption(f"Polygon key detected: {bool(_poly_key)} | Last source: {_last_src}")
     except Exception:
         pass
 
@@ -1744,7 +765,7 @@ def _fetch_ohlc_uncached(
     except Exception:
         pass
 
-    # Decide order for providers: Polygon -> Alpaca -> yfinance -> yahooquery -> Stooq(1d)
+    # Decide order for providers: Polygon -> yfinance -> yahooquery -> Stooq(1d)
 
     # Helper: Polygon first if configured
     def _try_polygon():
@@ -1787,238 +808,7 @@ def _fetch_ohlc_uncached(
                 pass
         return None
 
-    # Helper: Alpaca Market Data API
-    def _try_alpaca():
-        try:
-            # Support both ALPACA_* and APCA_* naming conventions + sidebar overrides
-            key_id = None
-            secret = None
-            data_base = None
-            try:
-                key_id = st.session_state.get('alpaca_key_id')
-                secret = st.session_state.get('alpaca_secret_key')
-                data_base = st.session_state.get('alpaca_data_url')
-            except Exception:
-                pass
-            # Env fallback (support multiple common names)
-            key_id = key_id or os.getenv('ALPACA_API_KEY_ID') or os.getenv('APCA_API_KEY_ID') or os.getenv('ALPACA_API_KEY')
-            secret = secret or os.getenv('ALPACA_API_SECRET_KEY') or os.getenv('APCA_API_SECRET_KEY') or os.getenv('ALPACA_SECRET_KEY')
-            if not key_id or not secret:
-                return None
-            # Data API base URL (not the trading API URL)
-            data_base = data_base or os.getenv('APCA_API_DATA_URL') or 'https://data.alpaca.markets'
-            tf_map = {
-                '1m': '1Min', '5m': '5Min', '15m': '15Min', '30m': '30Min', '60m': '1Hour', '1h': '1Hour', '1d': '1Day'
-            }
-            tf = tf_map.get(_interval, '1Day')
-
-            # Build time window
-            _start = start
-            _end = end
-            if not _start or not _end:
-                # Derive from period
-                now = datetime.utcnow().replace(tzinfo=timezone.utc)
-                end_dt = now
-                per_days = {
-                    '1d': 1, '5d': 5, '7d': 7, '14d': 14, '30d': 30, '60d': 60, '90d': 90,
-                    '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365, '2y': 730, '5y': 1825, '10y': 3650, 'max': 36500
-                }
-                days = per_days.get(str(period).lower() if period else '1y', 365)
-                start_dt = end_dt - timedelta(days=days)
-                _start = start_dt.isoformat().replace('+00:00', 'Z')
-                _end = end_dt.isoformat().replace('+00:00', 'Z')
-            else:
-                # Ensure RFC3339
-                try:
-                    _start = pd.to_datetime(_start).tz_localize('UTC', nonexistent='shift_forward', ambiguous='NaT').isoformat().replace('+00:00', 'Z')
-                except Exception:
-                    _start = str(_start)
-                try:
-                    _end = pd.to_datetime(_end).tz_localize('UTC', nonexistent='shift_forward', ambiguous='NaT').isoformat().replace('+00:00', 'Z')
-                except Exception:
-                    _end = str(_end)
-
-            import requests as _rq
-            url = f"{data_base.rstrip('/')}/v2/stocks/{ticker}/bars"
-            params = {"timeframe": tf, "start": _start, "end": _end, "limit": 10000}
-            headers = {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret}
-            resp = _rq.get(url, params=params, headers=headers, timeout=20)
-            if resp.status_code != 200:
-                try:
-                    st.session_state['last_fetch_errors'].append(f"alpaca: HTTP {resp.status_code} {resp.text[:120]}")
-                except Exception:
-                    pass
-                return None
-            js = resp.json() or {}
-            bars = js.get('bars') or []
-            if not bars:
-                return None
-            dfa = pd.DataFrame(bars)
-            # Columns typically: t (ISO time), o,h,l,c,v
-            if 't' in dfa.columns:
-                dfa['t'] = pd.to_datetime(dfa['t'], errors='coerce')
-                dfa = dfa.set_index('t')
-            rename = {'o':'Open','h':'High','l':'Low','c':'Close','v':'Volume'}
-            dfa = dfa.rename(columns=rename)
-            keep = [c for c in ['Open','High','Low','Close','Volume'] if c in dfa.columns]
-            dfa = dfa[keep]
-            if dfa.empty:
-                return None
-            try:
-                st.session_state['last_fetch_provider'] = 'alpaca'
-            except Exception:
-                pass
-            return dfa
-        except Exception as e:
-            try:
-                st.session_state['last_fetch_errors'].append(f"alpaca: {e}")
-            except Exception:
-                pass
-            return None
-
     # Helper: yahooquery block
-    # Helper: Tiingo (intraday and daily)
-    def _try_tiingo():
-        try:
-            token = os.getenv('TIINGO_API_KEY') or os.getenv('TIINGO_TOKEN')
-            if not token:
-                return None
-            import requests as _rq
-            base = 'https://api.tiingo.com'
-            # Decide endpoint by interval
-            if _interval == '1d':
-                # Daily endpoint
-                url = f"{base}/tiingo/daily/{ticker}/prices"
-                params = {}
-                if start:
-                    params['startDate'] = str(pd.to_datetime(start).date())
-                if end:
-                    params['endDate'] = str(pd.to_datetime(end).date())
-                params['token'] = token
-                resp = _rq.get(url, params=params, timeout=20)
-                if resp.status_code != 200:
-                    try:
-                        st.session_state['last_fetch_errors'].append(f"tiingo daily: HTTP {resp.status_code}")
-                    except Exception:
-                        pass
-                    return None
-                arr = resp.json() or []
-                if not arr:
-                    return None
-                dft = pd.DataFrame(arr)
-                # Fields: date, open, high, low, close, volume, adjClose, ...
-                if 'date' in dft.columns:
-                    dft['date'] = pd.to_datetime(dft['date'], errors='coerce')
-                    dft = dft.set_index('date')
-                rename = {'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'}
-                dft = dft.rename(columns=rename)
-                keep = [c for c in ['Open','High','Low','Close','Volume'] if c in dft.columns]
-                dft = dft[keep]
-            else:
-                # Intraday via IEX endpoint, resampled by Tiingo
-                tf_map = {'1m':'1min','5m':'5min','15m':'15min','30m':'30min','60m':'60min','1h':'60min'}
-                tf = tf_map.get(_interval, '5min')
-                url = f"{base}/iex/{ticker}/prices"
-                params = {'resampleFreq': tf, 'columns': 'open,high,low,close,volume', 'token': token}
-                # Tiingo accepts startDate and endDate (dates) for intraday as well
-                if start:
-                    params['startDate'] = str(pd.to_datetime(start).date())
-                if end:
-                    params['endDate'] = str(pd.to_datetime(end).date())
-                resp = _rq.get(url, params=params, timeout=20)
-                if resp.status_code != 200:
-                    try:
-                        st.session_state['last_fetch_errors'].append(f"tiingo iex: HTTP {resp.status_code}")
-                    except Exception:
-                        pass
-                    return None
-                arr = resp.json() or []
-                if not arr:
-                    return None
-                dft = pd.DataFrame(arr)
-                # Fields: date (ISO), open, high, low, close, volume
-                if 'date' in dft.columns:
-                    dft['date'] = pd.to_datetime(dft['date'], errors='coerce')
-                    dft = dft.set_index('date')
-                rename = {'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'}
-                dft = dft.rename(columns=rename)
-                keep = [c for c in ['Open','High','Low','Close','Volume'] if c in dft.columns]
-                dft = dft[keep]
-            if dft.empty:
-                return None
-            try:
-                st.session_state['last_fetch_provider'] = 'tiingo'
-            except Exception:
-                pass
-            return dft
-        except Exception as e:
-            try:
-                st.session_state['last_fetch_errors'].append(f"tiingo: {e}")
-            except Exception:
-                pass
-            return None
-
-    # Helper: Twelve Data (intraday and daily)
-    def _try_twelvedata():
-        try:
-            token = os.getenv('TWELVEDATA_API_KEY')
-            if not token:
-                return None
-            import requests as _rq
-            base = 'https://api.twelvedata.com'
-            tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '60m': '60min', '1h': '1h', '1d': '1day'}
-            tf = tf_map.get(_interval, _interval)
-            params = {'symbol': ticker, 'interval': tf, 'apikey': token, 'outputsize': 5000, 'order': 'ASC'}
-            if not period and start:
-                try:
-                    params['start_date'] = pd.to_datetime(start).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    params['start_date'] = str(start)
-            if not period and end:
-                try:
-                    params['end_date'] = pd.to_datetime(end).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    params['end_date'] = str(end)
-            resp = _rq.get(f"{base}/time_series", params=params, timeout=20)
-            if resp.status_code != 200:
-                try:
-                    st.session_state['last_fetch_errors'].append(f"twelvedata: HTTP {resp.status_code}")
-                except Exception:
-                    pass
-                return None
-            js = resp.json() or {}
-            if js.get('status') == 'error':
-                try:
-                    st.session_state['last_fetch_errors'].append(f"twelvedata: {js.get('message','error')}")
-                except Exception:
-                    pass
-                return None
-            data = js.get('values') or js.get('data') or []
-            if not data:
-                return None
-            dft = pd.DataFrame(data)
-            rename = {'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume','datetime':'Date'}
-            dft = dft.rename(columns=rename)
-            if 'Date' in dft.columns:
-                dft['Date'] = pd.to_datetime(dft['Date'], errors='coerce')
-                dft = dft.set_index('Date')
-            keep = [c for c in ['Open','High','Low','Close','Volume'] if c in dft.columns]
-            dft = dft[keep].apply(pd.to_numeric, errors='coerce')
-            dft = dft.sort_index()
-            if dft.empty:
-                return None
-            try:
-                st.session_state['last_fetch_provider'] = 'twelvedata'
-            except Exception:
-                pass
-            return dft
-        except Exception as e:
-            try:
-                st.session_state['last_fetch_errors'].append(f"twelvedata: {e}")
-            except Exception:
-                pass
-            return None
-
     def _try_yahooquery():
         try:
             from yahooquery import Ticker as _YQTicker
@@ -2058,41 +848,18 @@ def _fetch_ohlc_uncached(
                 pass
             return None
 
-    # Preferred real-time providers (Polygon, Alpaca, Tiingo)
-    providers = [("Polygon", _try_polygon), ("Alpaca", _try_alpaca), ("Tiingo", _try_tiingo)]
-    try:
-        pref = st.session_state.get('preferred_provider')
-    except Exception:
-        pref = None
-    # Build provider order including Twelve Data (Polygon and Tiingo first)
-    def _auto_providers():
-        return [("Polygon", _try_polygon), ("Tiingo", _try_tiingo), ("Alpaca", _try_alpaca), ("TwelveData", _try_twelvedata)]
-    if pref and isinstance(pref, str) and pref.startswith("Polygon"):
-        providers = [("Polygon", _try_polygon), ("Tiingo", _try_tiingo), ("Alpaca", _try_alpaca), ("TwelveData", _try_twelvedata)]
-    elif pref and isinstance(pref, str) and pref.startswith("Alpaca"):
-        providers = [("Alpaca", _try_alpaca), ("Polygon", _try_polygon), ("Tiingo", _try_tiingo), ("TwelveData", _try_twelvedata)]
-    elif pref and isinstance(pref, str) and pref.startswith("Tiingo"):
-        providers = [("Tiingo", _try_tiingo), ("Polygon", _try_polygon), ("Alpaca", _try_alpaca), ("TwelveData", _try_twelvedata)]
-    elif pref and isinstance(pref, str) and pref.lower().startswith("twelvedata"):
-        providers = [("TwelveData", _try_twelvedata), ("Polygon", _try_polygon), ("Alpaca", _try_alpaca), ("Tiingo", _try_tiingo)]
-    else:
-        providers = _auto_providers()
-    for _name, _fn in providers:
-        try:
-            _df = _fn()
-            if isinstance(_df, _pd.DataFrame) and not _df.empty:
-                return _df
-        except Exception:
-            pass
+    # 1) Polygon first if available
+    poly_df = _try_polygon()
+    if isinstance(poly_df, _pd.DataFrame) and not poly_df.empty:
+        return poly_df
 
-    # yfinance with small retries
+    # 2) yfinance with small retries
     for attempt in range(3):
         try:
-            _prepost = (_interval != "1d")
             if period:
-                df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=False, threads=False, prepost=_prepost)
+                df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=False, threads=False)
             else:
-                df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=False, threads=False, prepost=_prepost)
+                df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=False, threads=False)
             if isinstance(df, _pd.DataFrame) and not df.empty:
                 try:
                     st.session_state['last_fetch_provider'] = 'yfinance'
@@ -2108,11 +875,10 @@ def _fetch_ohlc_uncached(
 
     # Retry with auto_adjust=True once
     try:
-        _prepost = (_interval != "1d")
         if period:
-            df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=True, threads=False, prepost=_prepost)
+            df = yf.download(ticker, period=period, interval=_interval, progress=False, auto_adjust=True, threads=False)
         else:
-            df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=True, threads=False, prepost=_prepost)
+            df = yf.download(ticker, start=start, end=end, interval=_interval, progress=False, auto_adjust=True, threads=False)
         if isinstance(df, _pd.DataFrame) and not df.empty:
             return df
     except Exception as e:
@@ -2121,7 +887,7 @@ def _fetch_ohlc_uncached(
         except Exception:
             pass
 
-    # 4) yahooquery fallback
+    # 3) yahooquery fallback
     yq_df = _try_yahooquery()
     if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
         if isinstance(yq_df, _pd.DataFrame) and not yq_df.empty:
@@ -2131,7 +897,7 @@ def _fetch_ohlc_uncached(
                 pass
         return yq_df
 
-    # 5) Stooq daily fallback via pandas-datareader (only for 1d)
+    # 3) Stooq daily fallback via pandas-datareader (only for 1d)
     try:
         if _interval == '1d':
             try:
@@ -2933,7 +1699,7 @@ def _compute_gap_drop_stats(daily: pd.DataFrame, mode: str, threshold_pct: float
     return out
 
 # ---------------- CHART TAB ----------------
-if nav == 'Chart':
+with tab1:
     # --- Simple Backtest Logic ---
     def backtest_price_crosses_vwap(price: pd.Series, vwap: pd.Series):
             signals = (price > vwap) & (price.shift(1) <= vwap.shift(1))
@@ -3059,91 +1825,6 @@ if nav == 'Chart':
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            # Quick data freshness panel
-            try:
-                last_dt = None
-                if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
-                    last_dt = df.index.max()
-                info_col1, info_col2 = st.columns([3,1])
-                with info_col1:
-                    if last_dt is not None:
-                        prov = st.session_state.get('last_fetch_provider', '-')
-                        st.caption(f"Data ends: {pd.to_datetime(last_dt).strftime('%Y-%m-%d %H:%M')} • Source: {prov}")
-                with info_col2:
-                    if st.button('Refresh Data'):
-                        try:
-                            st.session_state['force_refresh'] = True
-                        except Exception:
-                            pass
-                        st.rerun()
-            except Exception:
-                pass
-
-            # Optionally append today's partial daily bar using intraday data
-            try:
-                if (interval == "1d") and append_today_daily:
-                    # Use market timezone (America/New_York) to define "today"
-                    try:
-                        import pytz as _pytz
-                        _ny_tz = _pytz.timezone('America/New_York')
-                    except Exception:
-                        _ny_tz = None
-                    if _ny_tz is not None:
-                        today = pd.Timestamp.now(tz=_ny_tz).date()
-                    else:
-                        today = pd.Timestamp.utcnow().tz_localize(None).date()
-                    # Fetch 5m intraday to construct today's OHLCV
-                    intr = None
-                    for tk in fetch_tickers:
-                        intr = fetch_ohlc_with_fallback(tk, interval="5m", period="5d")
-                        if intr is not None and not intr.empty:
-                            break
-                    if isinstance(intr, pd.DataFrame) and not intr.empty and isinstance(intr.index, pd.DatetimeIndex):
-                        intr = normalize_ohlcv(intr)
-                        # Align intraday index to America/New_York for day grouping
-                        try:
-                            if intr.index.tz is None:
-                                intr_idx_ny = intr.index.tz_localize('UTC').tz_convert('America/New_York')
-                            else:
-                                intr_idx_ny = intr.index.tz_convert('America/New_York')
-                        except Exception:
-                            # Fallback: treat naive as local
-                            intr_idx_ny = intr.index
-                        # Determine target session date from the data if available; otherwise use 'today'
-                        try:
-                            target_date = pd.Index(intr_idx_ny).date.max()
-                        except Exception:
-                            target_date = today
-                        intr_today = intr[(pd.Index(intr_idx_ny).date) == target_date]
-                        # Record debug info for UI
-                        try:
-                            st.session_state['today_debug'] = {
-                                'provider': st.session_state.get('last_fetch_provider', '-'),
-                                'intraday_rows': int(len(intr_today)),
-                                'intraday_start': str(intr_today.index.min()) if not intr_today.empty else '-',
-                                'intraday_end': str(intr_today.index.max()) if not intr_today.empty else '-',
-                                'target_date': str(target_date),
-                            }
-                        except Exception:
-                            pass
-                        if not intr_today.empty:
-                            o = float(intr_today["Open"].iloc[0]) if "Open" in intr_today.columns else float('nan')
-                            h = float(intr_today["High"].max()) if "High" in intr_today.columns else float('nan')
-                            l = float(intr_today["Low"].min()) if "Low" in intr_today.columns else float('nan')
-                            c = float(intr_today["Close"].iloc[-1]) if "Close" in intr_today.columns else float('nan')
-                            v = float(intr_today["Volume"].sum()) if "Volume" in intr_today.columns else float('nan')
-                            # Append or replace today's row
-                            idx = pd.to_datetime(pd.Timestamp(today))
-                            new_row = pd.DataFrame({"Open":[o],"High":[h],"Low":[l],"Close":[c],"Volume":[v]}, index=[idx])
-                            if isinstance(df.index, pd.DatetimeIndex):
-                                if (df.index.date == today).any():
-                                    df = pd.concat([df[~(df.index.date == today)], new_row])
-                                else:
-                                    df = pd.concat([df, new_row])
-                                df = df.sort_index()
-            except Exception:
-                pass
-
             # Determine VWAP anchor index from input (overlay not required for backtest)
             vwap_idx = None
             if vwap_anchor:
@@ -3155,21 +1836,11 @@ if nav == 'Chart':
                 except Exception:
                     vwap_idx = None
 
-            # Option: if daily interval and user wants only the latest day, slice to last date
-            try:
-                if (interval == "1d") and bool(show_only_latest_day) and isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
-                    _last_date = df.index.max().date()
-                    df = df[(df.index.date == _last_date)]
-            except Exception:
-                pass
-
-            # Count rows for subplots (optional Volume, Turnover, RSI, Stoch, MACD panel)
-            base_rows = 1 + (1 if show_volume else 0) + (1 if show_turnover else 0)
+            # Count rows for subplots (optional Volume, RSI, Stoch, MACD panel)
+            base_rows = 1 + (1 if show_volume else 0)
             rows = base_rows + (1 if show_rsi else 0) + (1 if show_sto else 0) + (1 if show_macd else 0)
             row_heights = [0.55]
             if show_volume:
-                row_heights.append(0.13)
-            if show_turnover:
                 row_heights.append(0.13)
             if show_rsi:
                 row_heights.append(0.09)
@@ -3183,24 +1854,10 @@ if nav == 'Chart':
             if True:
                 if True:
 
-                    # Main candlestick (cleaner aesthetics with optional thin/no-fill)
-                    if thin_candles:
-                        inc_fill = "rgba(0,0,0,0)"
-                        dec_fill = "rgba(0,0,0,0)"
-                        line_w = 1.2
-                    else:
-                        inc_fill = "#2ecc40"
-                        dec_fill = "#ff4136"
-                        line_w = 1.4
+                    # Main candlestick
                     fig.add_trace(go.Candlestick(
-                        x=df.index,
-                        open=df.get("Open"), high=df.get("High"), low=df.get("Low"), close=df.get("Close"),
-                        name="OHLC",
-                        increasing_line_color="#2ecc40", decreasing_line_color="#ff4136",
-                        increasing_fillcolor=inc_fill, decreasing_fillcolor=dec_fill,
-                        increasing=dict(line=dict(width=line_w)),
-                        decreasing=dict(line=dict(width=line_w)),
-                        opacity=0.95 if not thin_candles else 1.0
+                        x=df.index, open=df.get("Open"), high=df.get("High"),
+                        low=df.get("Low"), close=df.get("Close"), name="OHLC"
                     ), row=1, col=1)
 
                     close_key = pick_close_key(df.columns)
@@ -3284,29 +1941,7 @@ if nav == 'Chart':
                         else:
                             fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="Volume", showlegend=False), row=2, col=1)
 
-                    # Optional Dollar Value Traded panel (Close * Volume)
-                    if show_turnover:
-                        turn_row = 2 + (1 if show_volume else 0)
-                        if ("Close" in df.columns) and ("Volume" in df.columns) and df[["Close","Volume"]].notna().all(axis=1).any():
-                            dollar_val = (df["Close"].astype(float) * df["Volume"].astype(float))
-                            fig.add_trace(
-                                go.Bar(x=df.index, y=dollar_val, name="$ Value Traded", marker_color="rgba(0,123,255,0.6)", showlegend=False),
-                                row=turn_row, col=1
-                            )
-                            # Optional 30-day moving average overlay
-                            try:
-                                if show_turnover_ma and int(turnover_ma_len) > 1:
-                                    dv_ma = dollar_val.rolling(int(turnover_ma_len)).mean()
-                                    fig.add_trace(
-                                        go.Scatter(x=df.index, y=dv_ma, mode="lines", name=f"$ Value {int(turnover_ma_len)}d MA", line=dict(color="#ffae42", width=2)),
-                                        row=turn_row, col=1
-                                    )
-                            except Exception:
-                                pass
-                        else:
-                            fig.add_trace(go.Bar(x=df.index, y=[0]*len(df), name="$ Value Traded", showlegend=False), row=turn_row, col=1)
-
-                    next_row = 2 + (1 if show_volume else 0) + (1 if show_turnover else 0)
+                    next_row = 2 + (1 if show_volume else 0)
                     if show_rsi:
                         r = rsi(close, int(rsi_len))
                         fig.add_trace(go.Scatter(x=df.index, y=r, mode="lines", name=r.name), row=next_row, col=1)
@@ -3394,74 +2029,9 @@ if nav == 'Chart':
                                 name="Sell"
                             ), row=1, col=1)
 
-                    # Tighter margins if price labels hidden; x unified hover for clarity
-                    right_margin = 120 if show_price_labels else 60
-                    fig.update_layout(
-                        title=f"{ticker} - {interval}",
-                        xaxis_rangeslider_visible=False,
-                        height=base_height,
-                        margin=dict(l=50, r=right_margin, t=50, b=50),
-                        hovermode="x unified",
-                        hoverlabel=dict(bgcolor="#111" if template=="plotly_dark" else "#f8f8f8", font_size=12)
-                    )
-                    # Add weekend breaks and optional intraday overnight removal
-                    extra_rb = []
-                    if intraday and hide_overnight:
-                        extra_rb.append(dict(bounds=[16, 9.5], pattern="hour"))  # 4pm -> 9:30am ET
-                    style_axes(fig, dark=(template == "plotly_dark"), rows=rows, extra_rangebreaks=extra_rb,
-                               minimalist=minimalist_mode, nticks=(6 if minimalist_mode else None))
-
-                    # Overlay scan highlights if present
-                    try:
-                        if bool(show_scan_marks):
-                            hl = st.session_state.get('scan_highlights') or []
-                            if hl:
-                                for dstr in hl:
-                                    try:
-                                        dt0 = pd.to_datetime(dstr)
-                                        fig.add_vrect(x0=dt0, x1=dt0 + pd.Timedelta(days=1), fillcolor='rgba(255,0,0,0.08)', line_width=0)
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-
-                    # Quick KPI for turnover if enabled
-                    try:
-                        if show_turnover and ("Close" in df.columns) and ("Volume" in df.columns) and len(df) > 0:
-                            last_turn = float(df["Close"].iloc[-1]) * float(df["Volume"].iloc[-1])
-                            ma_len = int(turnover_ma_len) if show_turnover_ma else 30
-                            avgN = float((df["Close"].astype(float) * df["Volume"].astype(float)).rolling(ma_len).mean().iloc[-1]) if len(df) >= ma_len else None
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.metric("Last $ Traded", f"${last_turn:,.0f}")
-                            with c2:
-                                if avgN is not None and not np.isnan(avgN):
-                                    st.metric(f"{ma_len}d Avg $ Traded", f"${avgN:,.0f}")
-                    except Exception:
-                        pass
-
-                    # Today Debug expander (when daily aggregation from intraday is enabled)
-                    try:
-                        if False and (interval == '1d') and append_today_daily:
-                            dbg = st.session_state.get('today_debug') or {}
-                            with st.expander('Today Debug'):
-                                st.caption(f"Provider: {dbg.get('provider','-')} | Rows today: {dbg.get('intraday_rows','-')} | Window: {dbg.get('intraday_start','-')} → {dbg.get('intraday_end','-')}")
-                    except Exception:
-                        pass
-
-                    # Additional safe Today Debug block
-                    try:
-                        if False and (interval == '1d') and append_today_daily:
-                            dbg = st.session_state.get('today_debug') or {}
-                            with st.expander('Today Debug (alt)'):
-                                st.caption(
-                                    f"Provider: {dbg.get('provider','-')} | Rows today: {dbg.get('intraday_rows','-')}"
-                                )
-                                st.caption(
-                                    f"Window: {dbg.get('intraday_start','-')} -> {dbg.get('intraday_end','-')}"
-                                )
-                    except Exception:
-                        pass
+                    fig.update_layout(title=f"{ticker} - {interval}", xaxis_rangeslider_visible=False, height=base_height,
+                                      margin=dict(l=50, r=120, t=50, b=50))
+                    style_axes(fig, dark=(template == "plotly_dark"), rows=rows)
 
                     st.plotly_chart(fig, use_container_width=True)
                     provider = None
@@ -3471,13 +2041,6 @@ if nav == 'Chart':
                         pass
                     src = f" | Source: {provider}" if provider else ""
                     st.caption(f"Rows: {len(df)} | Columns: {list(df.columns)}{src}")
-                    try:
-                        import pandas as _pd
-                        if isinstance(df.index, _pd.DatetimeIndex) and len(df.index) > 0:
-                            st.caption(f"Last bar: {str(df.index.max())}")
-                    except Exception:
-                        pass
-
 
                     # --- Historical Stats (from uploaded Excel only) ---
                     with st.expander("Historical Gap/Drop Stats"):
@@ -3619,19 +2182,8 @@ if nav == 'Chart':
     except Exception as e:
         st.error(f"Error fetching or plotting data: {e}")
 
-    # Bottom Diagnostics expander (moved debug/info here to declutter UI)
-    with st.expander("Diagnostics", expanded=False):
-        try:
-            dbg = st.session_state.get('today_debug') or {}
-            provider = st.session_state.get('last_fetch_provider', '-')
-            st.caption(f"Provider: {provider} | Rows today: {dbg.get('intraday_rows','-')}")
-            if dbg:
-                st.caption(f"Window: {dbg.get('intraday_start','-')} -> {dbg.get('intraday_end','-')} | Target: {dbg.get('target_date','-')}")
-        except Exception:
-            pass
-
-# ---------------- TradingView ----------------
-if nav == 'TradingView':
+# ---------------- TRADINGVIEW TAB ----------------
+with tab3:
     st.subheader("TradingView (embedded)")
     _tv_interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "60m": "60", "1d": "D"}
     tv_interval = _tv_interval_map.get(interval, "D")
@@ -3697,35 +2249,6 @@ def fetch_expirations(ticker: str, cache_buster: str | None = None) -> list[str]
     st.session_state['opt_errors'] = []
     # Decide order: equities -> yahooquery ? yfinance ? polygon; others -> polygon ? yfinance ? yahooquery
     eq = is_equity_symbol(ticker)
-    # Tradier first if token present
-    try:
-        token = st.session_state.get('tradier_token') or os.getenv('TRADIER_TOKEN')
-        sandbox = bool(st.session_state.get('tradier_sandbox') or (os.getenv('TRADIER_SANDBOX', '').strip() not in ('', '0', 'false', 'False')))
-    except Exception:
-        token = os.getenv('TRADIER_TOKEN')
-        sandbox = os.getenv('TRADIER_SANDBOX', '').strip() not in ('', '0', 'false', 'False')
-    if token:
-        try:
-            import requests as _rq
-            base = 'https://sandbox.tradier.com/v1' if sandbox else 'https://api.tradier.com/v1'
-            resp = _rq.get(
-                f"{base}/markets/options/expirations",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                params={"symbol": ticker, "includeAllRoots": "true", "strikes": "false"},
-                timeout=10,
-            )
-            if resp.ok:
-                js = resp.json()
-                dates = js.get('expirations', {}).get('date')
-                if isinstance(dates, list) and dates:
-                    st.session_state['opt_last_provider'] = 'tradier'
-                    return dates
-                else:
-                    st.session_state['opt_errors'].append('tradier: empty expirations')
-            else:
-                st.session_state['opt_errors'].append(f'tradier: HTTP {resp.status_code}')
-        except Exception as e:
-            st.session_state['opt_errors'].append(f'tradier: {e}')
     # Polygon first (if key present)
     try:
         api_key = None
@@ -3790,46 +2313,6 @@ def fetch_chain(ticker: str, expiration: str):
     """Fetch option chain for an expiration: Polygon -> yfinance -> yahooquery. Records diagnostics."""
     import pandas as _pd
     st.session_state['opt_errors'] = st.session_state.get('opt_errors', [])
-    # Tradier first if token present
-    try:
-        token = st.session_state.get('tradier_token') or os.getenv('TRADIER_TOKEN')
-        sandbox = bool(st.session_state.get('tradier_sandbox') or (os.getenv('TRADIER_SANDBOX', '').strip() not in ('', '0', 'false', 'False')))
-    except Exception:
-        token = os.getenv('TRADIER_TOKEN')
-        sandbox = os.getenv('TRADIER_SANDBOX', '').strip() not in ('', '0', 'false', 'False')
-    if token:
-        try:
-            import requests as _rq
-            base = 'https://sandbox.tradier.com/v1' if sandbox else 'https://api.tradier.com/v1'
-            resp = _rq.get(
-                f"{base}/markets/options/chains",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                params={"symbol": ticker, "expiration": expiration},
-                timeout=10,
-            )
-            if resp.ok:
-                js = resp.json()
-                opt = js.get('options', {}).get('option') or []
-                if isinstance(opt, dict):
-                    opt = [opt]
-                df = _pd.DataFrame(opt)
-                if not df.empty:
-                    # normalize columns
-                    cols = {str(c).replace(' ', '_').lower(): c for c in df.columns}
-                    df.columns = list(cols.keys())
-                    type_col = 'option_type' if 'option_type' in df.columns else None
-                    if type_col is None and 'type' in df.columns:
-                        type_col = 'type'
-                    calls = df[df.get(type_col, '').astype(str).str.lower().str.startswith('c')].copy() if type_col else df.copy()
-                    puts  = df[df.get(type_col, '').astype(str).str.lower().str.startswith('p')].copy() if type_col else _pd.DataFrame()
-                    st.session_state['opt_last_provider'] = 'tradier'
-                    return calls, puts
-                else:
-                    st.session_state['opt_errors'].append('tradier: empty chain')
-            else:
-                st.session_state['opt_errors'].append(f'tradier: HTTP {resp.status_code}')
-        except Exception as e:
-            st.session_state['opt_errors'].append(f'tradier: {e}')
     # Polygon first
     try:
         api_key = None
@@ -3919,7 +2402,7 @@ def spot_price(ticker: str) -> float | None:
         pass
     return None
 
-if nav == 'Options':
+with tab2:
     st.subheader("Options Chain")
     # Config section for greeks & charts
     cfg_col1, cfg_col2, cfg_col3, cfg_col4 = st.columns([1,1,1,2])
@@ -3952,59 +2435,27 @@ if nav == 'Options':
                     st.stop()
                 st.session_state["opts_expirations"] = exps
 
-                # Prefer the next future expiry (>= today). Fallback to nearest by absolute diff.
+                # nearest expiry (>= today)
                 today = datetime.now(timezone.utc).date()
-                try:
-                    exps_dt = [datetime.strptime(e, "%Y-%m-%d").date() for e in exps]
-                except Exception:
-                    exps_dt = []
-                future_pairs = [(e, d) for e, d in zip(exps, exps_dt) if d and d >= today]
-                if future_pairs:
-                    nearest = min(future_pairs, key=lambda p: (p[1] - today).days)[0]
-                else:
-                    nearest = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - today).days))
+                nearest = min(exps, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - today).days))
                 st.session_state["opts_selected_exp"] = nearest
 
             exps = st.session_state["opts_expirations"]
-            # Show future expirations first if available
-            today = datetime.now(timezone.utc).date()
-            try:
-                exps_dt = [datetime.strptime(e, "%Y-%m-%d").date() for e in exps]
-            except Exception:
-                exps_dt = []
-            future = [e for e, d in zip(exps, exps_dt) if d and d >= today]
-            exps_use = future or exps
-            sel_default = st.session_state.get("opts_selected_exp", (exps_use[0] if exps_use else None))
-            sel = st.selectbox("Expiration", options=exps_use, index=(exps_use.index(sel_default) if sel_default in exps_use else 0))
+            sel = st.selectbox("Expiration", options=exps, index=exps.index(st.session_state["opts_selected_exp"]))
             st.session_state["opts_selected_exp"] = sel
 
             with st.spinner(f"Fetching chain for {sel}..."):
                 calls, puts = fetch_chain(ticker, sel)
-                # If empty, auto-try nearby future expirations to find the first with data
                 if (calls is None or calls.empty) and (puts is None or puts.empty):
-                    tried = [sel]
-                    alt_found = False
-                    for alt in exps_use:
-                        if alt in tried:
-                            continue
-                        c2, p2 = fetch_chain(ticker, alt)
-                        if (c2 is not None and not c2.empty) or (p2 is not None and not p2.empty):
-                            calls, puts = c2, p2
-                            sel = alt
-                            st.session_state["opts_selected_exp"] = alt
-                            st.info(f"Selected nearest expiration with data: {alt}")
-                            alt_found = True
-                            break
-                    if not alt_found:
-                        st.warning("No option chain returned for this expiration.")
-                        try:
-                            diag = st.session_state.get('opt_errors') or []
-                            prov = st.session_state.get('opt_last_provider', '-')
-                            if diag:
-                                st.caption(f"Options diagnostics (last provider={prov}): {' | '.join(diag[-3:])}")
-                        except Exception:
-                            pass
-                        st.stop()
+                    st.warning("No option chain returned for this expiration.")
+                    try:
+                        diag = st.session_state.get('opt_errors') or []
+                        prov = st.session_state.get('opt_last_provider', '-')
+                        if diag:
+                            st.caption(f"Options diagnostics (last provider={prov}): {' | '.join(diag[-3:])}")
+                    except Exception:
+                        pass
+                    st.stop()
 
             # Add delta using BS with yfinance implied volatility if available
             S = spot_price(ticker)
@@ -4147,23 +2598,5 @@ if nav == 'Options':
 c
 
 
-
-
-
-try:
-    if os.environ.get("SHOW_XBBG_PANEL", "0").strip() == "1":
-        st.sidebar.markdown("**Bloomberg (xbbg)**")
-        if HAS_XBBG:
-            sym = st.sidebar.text_input("BBG Ticker (e.g., AAPL)", "AAPL")
-            if sym:
-                q = _bbg_quote(sym)
-                if q:
-                    st.sidebar.write(q)
-                else:
-                    st.sidebar.caption("No BBG data for that symbol or session not ready.")
-        else:
-            st.sidebar.caption("xbbg not installed/available.")
-except Exception:
-    pass
 
 
